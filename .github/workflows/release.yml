@@ -31,22 +31,37 @@ jobs:
           DFHACK_TAG: ${{ steps.dfhack.outputs.tag }}
         run: git clone --depth 1 --branch "$DFHACK_TAG" --recurse-submodules https://github.com/DFHack/dfhack.git dfhack
 
-      - name: Remove DFHack's built-in smooth-movement (this plugin replaces it)
-        run: |
-          rm -rf dfhack/plugins/smooth-movement
-          sed -i '/smooth-movement/d' dfhack/plugins/CMakeLists.txt
-          echo "Remaining references (should only be ours):"
-          grep -rn "smooth-movement" dfhack --include=CMakeLists.txt --include=*.cmake || true
-
       - name: Add the plugin to DFHack
         run: |
-          mkdir -p dfhack/plugins/external/smooth-movement
-          cp CMakeLists.txt smooth-movement.cpp test_visual_animation_manager.cpp visual_animation.h dfhack/plugins/external/smooth-movement/
+          mkdir -p dfhack/plugins/external/smooth-movement-adv
+          cp CMakeLists.txt smooth-movement.cpp test_visual_animation_manager.cpp visual_animation.h dfhack/plugins/external/smooth-movement-adv/
 
       - name: Build Linux plugin
         run: |
           cmake -S dfhack -B dfhack/build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_DOCS=OFF
-          cmake --build dfhack/build/linux --target smooth-movement
+          cmake --build dfhack/build/linux --target smooth-movement-adv 2>&1 | tee build.log
+          test "${PIPESTATUS[0]}" -eq 0
+
+      - name: Collect diagnostics (only runs if the build failed)
+        if: failure()
+        run: |
+          mkdir -p diag
+          grep -n "error" build.log | head -60 > diag/first-errors.txt || true
+          for f in graphic_viewportst.h global_objects.h viewport_spatter_flag.h; do
+            find dfhack -name "$f" -exec cp {} diag/ \; || true
+          done
+          find dfhack -name "df.graphic.xml" -exec cp {} diag/ \; || true
+          cp dfhack/plugins/external/smooth-movement-adv/smooth-movement.cpp diag/ || true
+          cp -r dfhack/plugins/smooth-movement diag/builtin-smooth-movement || true
+          echo "=== first errors ==="; cat diag/first-errors.txt
+          ls -la diag
+
+      - name: Save diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics
+          path: diag/
 
       - name: Build Windows plugin
         run: (cd dfhack/build && ./build-win64-from-linux.sh)
@@ -57,8 +72,8 @@ jobs:
         run: |
           release_tag="$GITHUB_REF_NAME-dfhack-$DFHACK_TAG"
           mkdir -p release/linux/hack/plugins release/windows/hack/plugins
-          install -m755 dfhack/build/linux/plugins/external/smooth-movement/smooth-movement.plug.so release/linux/hack/plugins/
-          install -m755 dfhack/build/win64-cross/output/hack/plugins/smooth-movement.plug.dll release/windows/hack/plugins/
+          install -m755 dfhack/build/linux/plugins/external/smooth-movement-adv/smooth-movement-adv.plug.so release/linux/hack/plugins/
+          install -m755 dfhack/build/win64-cross/output/hack/plugins/smooth-movement-adv.plug.dll release/windows/hack/plugins/
           (cd release/linux && zip -q -r "../smooth-movement-$release_tag-linux-x86_64.zip" hack)
           (cd release/windows && zip -q -r "../smooth-movement-$release_tag-windows-x86_64.zip" hack)
           for archive in release/*.zip; do unzip -t "$archive"; done
