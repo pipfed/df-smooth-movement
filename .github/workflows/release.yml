@@ -64,7 +64,12 @@ jobs:
           path: diag/
 
       - name: Build Windows plugin
-        run: (cd dfhack/build && ./build-win64-from-linux.sh)
+        run: |
+          # An unrelated DFHack plugin (logistics) can fail to link on the runner; only our DLL matters.
+          (cd dfhack/build && ./build-win64-from-linux.sh) || echo "full build reported errors; checking for our DLL"
+          dll=$(find dfhack/build -name smooth-movement-adv.plug.dll | head -1)
+          test -n "$dll" || { echo "our DLL was not built"; exit 1; }
+          echo "found $dll"
 
       - name: Package plugins
         env:
@@ -73,7 +78,7 @@ jobs:
           release_tag="$GITHUB_REF_NAME-dfhack-$DFHACK_TAG"
           mkdir -p release/linux/hack/plugins release/windows/hack/plugins
           install -m755 dfhack/build/linux/plugins/external/smooth-movement-adv/smooth-movement-adv.plug.so release/linux/hack/plugins/
-          install -m755 dfhack/build/win64-cross/output/hack/plugins/smooth-movement-adv.plug.dll release/windows/hack/plugins/
+          install -m755 "$(find dfhack/build -name smooth-movement-adv.plug.dll | head -1)" release/windows/hack/plugins/
           (cd release/linux && zip -q -r "../smooth-movement-$release_tag-linux-x86_64.zip" hack)
           (cd release/windows && zip -q -r "../smooth-movement-$release_tag-windows-x86_64.zip" hack)
           for archive in release/*.zip; do unzip -t "$archive"; done
