@@ -14,11 +14,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Get the latest DFHack release
+      - name: Choose the DFHack version to build against
         id: dfhack
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: echo "tag=$(gh api repos/DFHack/dfhack/releases/latest --jq .tag_name)" >> "$GITHUB_OUTPUT"
+          # EDIT THIS LINE: it must be exactly the version `dfhack-version` prints in your game.
+          DFHACK_VERSION: "53.16-r1.1"
+        run: echo "tag=$DFHACK_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install Linux build dependencies
         run: |
