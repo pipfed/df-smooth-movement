@@ -30,6 +30,13 @@ jobs:
           DFHACK_TAG: ${{ steps.dfhack.outputs.tag }}
         run: git clone --depth 1 --branch "$DFHACK_TAG" --recurse-submodules https://github.com/DFHack/dfhack.git dfhack
 
+      - name: Remove DFHack's built-in smooth-movement (this plugin replaces it)
+        run: |
+          rm -rf dfhack/plugins/smooth-movement
+          sed -i '/smooth-movement/d' dfhack/plugins/CMakeLists.txt
+          echo "Remaining references (should only be ours):"
+          grep -rn "smooth-movement" dfhack --include=CMakeLists.txt --include=*.cmake || true
+
       - name: Add the plugin to DFHack
         run: |
           mkdir -p dfhack/plugins/external/smooth-movement
