@@ -31,7 +31,7 @@
 
 using namespace DFHack;
 
-DFHACK_PLUGIN("smooth-movement");
+DFHACK_PLUGIN("smooth-movement-adv");
 DFHACK_PLUGIN_IS_ENABLED(is_enabled);
 
 REQUIRE_GLOBAL(enabler);
@@ -72,9 +72,9 @@ bool flip_enabled=false;
 // camera glide the player stands still on screen while the whole map snaps. So in adventure mode
 // (when `adventure on`, the default) the free camera glide is switched on and steps ease linearly.
 // Leaving adventure mode restores what was set before. Fortress mode is untouched.
-uint32_t step_duration_ms=100;       // `smooth-movement speed <ms>`
-bool linear_ease_user=false;         // `smooth-movement ease linear|smooth`
-bool adventure_preset=true;          // `smooth-movement adventure on|off`
+uint32_t step_duration_ms=100;       // `smooth-movement-adv speed <ms>`
+bool linear_ease_user=false;         // `smooth-movement-adv ease linear|smooth`
+bool adventure_preset=true;          // `smooth-movement-adv adventure on|off`
 bool preset_active=false;
 bool preset_saved_camera=false;
 
@@ -88,16 +88,16 @@ void apply_animation_settings()
 // The camera is visually unbound from the tile grid. Two layered offsets:
 //   rest      -- a PERSISTENT sub-tile offset in tiles: the free camera. Set by pixel-perfect
 //                middle-mouse drag panning (the view rests wherever released, mid-tile or not)
-//                and by the `smooth-movement camera <fx> <fy>` console command. Survives zoom
+//                and by the `smooth-movement-adv camera <fx> <fy>` console command. Survives zoom
 //                and z-level changes. Kept in [-0.5,0.5] by normalization: whole-tile parts are
 //                folded into window_x/window_y (a plain UI scroll write -- NEVER the viewport
 //                dims, which crash DF; the sub-tile strip this leaves at one screen edge has no
 //                buffer data and stays black).
 //   transient -- the decaying scroll glide from before, in pixels, layered on top.
 // Render offset = transient + rest*tile. window_x/window_y remain the game's own tile camera.
-bool camera_enabled=false;                    // OFF by default: plain `enable smooth-movement`
+bool camera_enabled=false;                    // OFF by default: plain `enable smooth-movement-adv`
                                               // keeps upstream behavior (creature interpolation
-                                              // only); `smooth-movement camera on` opts in.
+                                              // only); `smooth-movement-adv camera on` opts in.
 constexpr int32_t camera_max_glide_tiles=3;   // per-jump: farther than this snaps instantly
 constexpr double camera_tau_ms=35.0;          // transient catch-up (~95% done after 100ms)
 double transient_x=0.0;                       // decaying glide offset, pixels
@@ -1405,7 +1405,7 @@ bool load_sdl(color_ostream &out)
 	#define bind(name,target) \
 		target=reinterpret_cast<decltype(target)>(LookupPlugin(sdl_handle,#name)); \
 		if(target==nullptr) { \
-			out.printerr("smooth-movement: SDL2 function unavailable: " #name "\n"); \
+			out.printerr("smooth-movement-adv: SDL2 function unavailable: " #name "\n"); \
 			clear_sdl_bindings(); \
 			return false; \
 		}
@@ -1452,7 +1452,7 @@ command_result status_command(
 	if(parameters.empty())
 		{
 		out.print(
-			"smooth-movement {}: {}\n",
+			"smooth-movement-adv {}: {}\n",
 			plugin_version,
 			is_enabled?"enabled":"disabled");
 		out.print("free camera: {}, offset {:.3f} {:.3f} (tiles east/south of the grid)\n",
@@ -1484,7 +1484,7 @@ command_result status_command(
 					}
 				step_duration_ms=uint32_t(value);
 				apply_animation_settings();
-				out.print("smooth-movement: step duration {} ms\n",step_duration_ms);
+				out.print("smooth-movement-adv: step duration {} ms\n",step_duration_ms);
 				return CR_OK;
 				}
 			catch(...)
@@ -1505,7 +1505,7 @@ command_result status_command(
 			{
 			linear_ease_user=parameters[1]=="linear";
 			apply_animation_settings();
-			out.print("smooth-movement: easing {}\n",
+			out.print("smooth-movement-adv: easing {}\n",
 				(linear_ease_user||preset_active)?"linear":"smooth");
 			return CR_OK;
 			}
@@ -1523,7 +1523,7 @@ command_result status_command(
 			{
 			adventure_preset=parameters[1]=="on";
 			update_mode_preset();   // apply or undo right away
-			out.print("smooth-movement: adventure mode tuning {}\n",
+			out.print("smooth-movement-adv: adventure mode tuning {}\n",
 				adventure_preset?"on":"off");
 			return CR_OK;
 			}
@@ -1594,14 +1594,14 @@ command_result status_command(
 			{
 			flip_enabled=true;
 			if(gps!=nullptr)++gps->force_full_display_count;
-			out.print("smooth-movement: sprite flipping enabled\n");
+			out.print("smooth-movement-adv: sprite flipping enabled\n");
 			return CR_OK;
 			}
 		if(parameters.size()==2&&parameters[1]=="off")
 			{
 			flip_enabled=false;
 			if(gps!=nullptr)++gps->force_full_display_count;
-			out.print("smooth-movement: sprite flipping disabled\n");
+			out.print("smooth-movement-adv: sprite flipping disabled\n");
 			return CR_OK;
 			}
 		return CR_WRONG_USAGE;
@@ -1615,7 +1615,7 @@ DFhackCExport command_result
 plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 {
 	commands.emplace_back(
-		"smooth-movement",
+		"smooth-movement-adv",
 		"Smooth movement status; free camera: camera on|off|reset|<fx> <fy>; "
 		"sprite flipping: flip on|off; step duration: speed <ms>; "
 		"easing: ease linear|smooth; adventure mode tuning: adventure on|off.",
@@ -1632,7 +1632,7 @@ DFhackCExport command_result plugin_enable(color_ostream &out,bool enable)
 		if(!load_sdl(out))return CR_FAILURE;
 		if(!INTERPOSE_HOOK(renderer_hook,update_all).apply())
 			{
-			out.printerr("smooth-movement: could not hook the 2D renderer\n");
+			out.printerr("smooth-movement-adv: could not hook the 2D renderer\n");
 			clear_sdl_bindings();
 			return CR_FAILURE;
 			}
@@ -1645,7 +1645,7 @@ DFhackCExport command_result plugin_enable(color_ostream &out,bool enable)
 		if(gps!=nullptr)++gps->force_full_display_count;
 		}
 	is_enabled=enable;
-	out.print("smooth-movement: {}\n",enable?"enabled":"disabled");
+	out.print("smooth-movement-adv: {}\n",enable?"enabled":"disabled");
 	return CR_OK;
 }
 
