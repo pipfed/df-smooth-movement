@@ -18,7 +18,7 @@ jobs:
         id: dfhack
         env:
           # EDIT THIS LINE: it must be exactly the version `dfhack-version` prints in your game.
-          DFHACK_VERSION: "53.16-r1.1"
+          DFHACK_VERSION: "53.17-r1"
         run: echo "tag=$DFHACK_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install Linux build dependencies
