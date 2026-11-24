@@ -6,6 +6,7 @@
 #include "VTableInterpose.h"
 
 #include "modules/DFSDL.h"
+#include "modules/World.h"
 
 #include "df/enabler.h"
 #include "df/graphic.h"
@@ -41,7 +42,7 @@ REQUIRE_GLOBAL(window_z);
 
 namespace {
 
-constexpr const char *plugin_version="0.3.0";
+constexpr const char *plugin_version="0.3.1";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -64,6 +65,24 @@ int32_t previous_pan_x=0;
 int32_t previous_pan_y=0;
 bool has_pan_context=false;
 bool flip_enabled=false;
+
+// --- adventure mode tuning ------------------------------------------------------------------
+// Adventure mode scrolls the map by a tile on every step the player takes, and a steady run is
+// a chain of single-tile steps. Easing in and out of each one reads as stutter, and without the
+// camera glide the player stands still on screen while the whole map snaps. So in adventure mode
+// (when `adventure on`, the default) the free camera glide is switched on and steps ease linearly.
+// Leaving adventure mode restores what was set before. Fortress mode is untouched.
+uint32_t step_duration_ms=100;       // `smooth-movement speed <ms>`
+bool linear_ease_user=false;         // `smooth-movement ease linear|smooth`
+bool adventure_preset=true;          // `smooth-movement adventure on|off`
+bool preset_active=false;
+bool preset_saved_camera=false;
+
+void apply_animation_settings()
+{
+	animation_manager.set_movement_duration_ms(step_duration_ms);
+	animation_manager.set_linear_easing(linear_ease_user||preset_active);
+}
 
 // --- free camera -------------------------------------------------------------------------------
 // The camera is visually unbound from the tile grid. Two layered offsets:
@@ -158,6 +177,21 @@ void set_camera_enabled(bool enable)
 	rest_y=0.0;
 	camera_has_prev=false;   // fresh observation baseline; no phantom scroll on re-enable
 	// camera_was_offset stays: the render path issues one cleanup redraw if we were mid-offset.
+}
+
+// Called every frame, before the animation runs: cheap, only acts when the game mode changes.
+void update_mode_preset()
+{
+	const bool wanted=adventure_preset&&World::isAdventureMode();
+	if(wanted==preset_active)return;
+	preset_active=wanted;
+	if(wanted)
+		{
+		preset_saved_camera=camera_enabled;
+		set_camera_enabled(true);
+		}
+	else set_camera_enabled(preset_saved_camera);
+	apply_animation_settings();
 }
 
 // Fold whole tiles of rest into window_x/window_y so |rest| <= 0.5 (minimal edge strip). The
@@ -1228,6 +1262,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	df::graphic_viewportst *vp=gps?gps->main_viewport:nullptr;
 	const std::vector<df::graphic_viewportst *> viewports=active_viewports();
 
+	update_mode_preset();
 	if(vp!=nullptr)update_visual_context(renderer,vp);
 	const uint32_t now_ms=Core::getInstance().p->getTickCount();
 	animation_manager.begin_frame(now_ms);
@@ -1396,6 +1431,12 @@ void reset_state()
 	camera_has_prev=false;
 	camera_was_offset=false;
 	flip_enabled=false;
+	step_duration_ms=100;
+	linear_ease_user=false;
+	adventure_preset=true;
+	preset_active=false;
+	preset_saved_camera=false;
+	apply_animation_settings();
 }
 
 command_result status_command(
@@ -1412,7 +1453,75 @@ command_result status_command(
 			camera_enabled?"on":"off",-rest_x,-rest_y);
 		out.print("sprite flipping: {}\n",
 			flip_enabled?"on":"off");
+		out.print("step duration: {} ms, easing: {}\n",
+			step_duration_ms,(linear_ease_user||preset_active)?"linear":"smooth");
+		out.print("adventure mode tuning: {}{}\n",
+			adventure_preset?"on":"off",preset_active?" (active now)":"");
 		return CR_OK;
+		}
+	if(parameters[0]=="speed")
+		{
+		if(parameters.size()==1)
+			{
+			out.print("step duration: {} ms\n",step_duration_ms);
+			return CR_OK;
+			}
+		if(parameters.size()==2)
+			{
+			try
+				{
+				const long value=std::stol(parameters[1]);
+				if(value<20||value>500)
+					{
+					out.printerr("speed must be 20..500 (milliseconds per tile step)\n");
+					return CR_FAILURE;
+					}
+				step_duration_ms=uint32_t(value);
+				apply_animation_settings();
+				out.print("smooth-movement: step duration {} ms\n",step_duration_ms);
+				return CR_OK;
+				}
+			catch(...)
+				{
+				return CR_WRONG_USAGE;
+				}
+			}
+		return CR_WRONG_USAGE;
+		}
+	if(parameters[0]=="ease")
+		{
+		if(parameters.size()==1)
+			{
+			out.print("easing: {}\n",(linear_ease_user||preset_active)?"linear":"smooth");
+			return CR_OK;
+			}
+		if(parameters.size()==2&&(parameters[1]=="linear"||parameters[1]=="smooth"))
+			{
+			linear_ease_user=parameters[1]=="linear";
+			apply_animation_settings();
+			out.print("smooth-movement: easing {}\n",
+				(linear_ease_user||preset_active)?"linear":"smooth");
+			return CR_OK;
+			}
+		return CR_WRONG_USAGE;
+		}
+	if(parameters[0]=="adventure")
+		{
+		if(parameters.size()==1)
+			{
+			out.print("adventure mode tuning: {}{}\n",
+				adventure_preset?"on":"off",preset_active?" (active now)":"");
+			return CR_OK;
+			}
+		if(parameters.size()==2&&(parameters[1]=="on"||parameters[1]=="off"))
+			{
+			adventure_preset=parameters[1]=="on";
+			update_mode_preset();   // apply or undo right away
+			out.print("smooth-movement: adventure mode tuning {}\n",
+				adventure_preset?"on":"off");
+			return CR_OK;
+			}
+		return CR_WRONG_USAGE;
 		}
 	if(parameters[0]=="camera")
 		{
@@ -1502,7 +1611,8 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 	commands.emplace_back(
 		"smooth-movement",
 		"Smooth movement status; free camera: camera on|off|reset|<fx> <fy>; "
-		"sprite flipping: flip on|off.",
+		"sprite flipping: flip on|off; step duration: speed <ms>; "
+		"easing: ease linear|smooth; adventure mode tuning: adventure on|off.",
 		status_command);
 	return CR_OK;
 }

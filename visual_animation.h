@@ -156,13 +156,17 @@ struct visual_movement_renderst
 	bool inherited=false;
 };
 
+// Smoothstep by default. Linear easing is for continuous travel (adventure mode walking or
+// sprinting): easing in and out of every single tile makes a steady run read as a stutter.
 inline float animation_progress(
 	uint32_t now_ms,
 	uint32_t start_time_ms,
-	uint32_t duration_ms)
+	uint32_t duration_ms,
+	bool linear_easing=false)
 {
 	const float linear=std::min(
 		1.0f,float(now_ms-start_time_ms)/duration_ms);
+	if(linear_easing)return linear;
 	return linear*linear*(3.0f-2.0f*linear);
 }
 
@@ -261,7 +265,11 @@ class visual_animation_managerst
 	bool force_full_redraw=false;
 	std::vector<viewport_animationst> viewports;
 
-	static constexpr uint32_t movement_duration_ms=100;
+	static constexpr uint32_t default_movement_duration_ms=100;
+	static constexpr uint32_t min_movement_duration_ms=20;
+	static constexpr uint32_t max_movement_duration_ms=500;
+	uint32_t movement_duration_ms=default_movement_duration_ms;
+	bool linear_easing=false;
 	// Scrolling faster than detection keeps up: give up rather than test ever more prefixes.
 	static constexpr size_t max_pending_shifts=8;
 	// Bounds the wait on a scroll that never lands, so suppression cannot stick forever.
@@ -408,11 +416,33 @@ class visual_animation_managerst
 	float movement_progress(uint32_t start_time_ms) const
 		{
 		return animation_progress(
-			frame_time_ms,start_time_ms,movement_duration_ms);
+			frame_time_ms,start_time_ms,movement_duration_ms,linear_easing);
 		}
 
 	public:
 		visual_animation_managerst()=default;
+
+		// How long one tile step takes to glide. Clamped so a bad value can't freeze or skip it.
+		void set_movement_duration_ms(uint32_t duration_ms)
+			{
+			movement_duration_ms=std::clamp(
+				duration_ms,min_movement_duration_ms,max_movement_duration_ms);
+			}
+
+		uint32_t get_movement_duration_ms() const
+			{
+			return movement_duration_ms;
+			}
+
+		void set_linear_easing(bool linear)
+			{
+			linear_easing=linear;
+			}
+
+		bool get_linear_easing() const
+			{
+			return linear_easing;
+			}
 
 		void begin_frame(uint32_t now_ms)
 			{

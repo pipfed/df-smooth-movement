@@ -414,6 +414,22 @@ int main()
 	}
 
 	assert(animation_progress(100,0,100)==1.0f);
+	// Smoothstep eases (25% of the time is under 25% of the way); linear does not.
+	assert(animation_progress(25,0,100)<0.25f);
+	assert(animation_progress(25,0,100,true)==0.25f);
+	assert(animation_progress(100,0,100,true)==1.0f);
+	{
+	// The duration and easing settings reach movement progress, and bad values are clamped.
+	visual_animation_managerst timing;
+	assert(timing.get_movement_duration_ms()==100&&!timing.get_linear_easing());
+	timing.set_movement_duration_ms(1);
+	assert(timing.get_movement_duration_ms()==20);
+	timing.set_movement_duration_ms(100000);
+	assert(timing.get_movement_duration_ms()==500);
+	timing.set_movement_duration_ms(200);
+	timing.set_linear_easing(true);
+	assert(timing.get_movement_duration_ms()==200&&timing.get_linear_easing());
+	}
 	assert(inherited_visual_source_tile(0,0,1)==-1);
 	assert(inherited_visual_source_tile(2,0,1)==1);
 	assert(visual_layer_descriptor(viewport_visual_layer::right).center_x==-1);
@@ -721,4 +737,28 @@ int main()
 		viewport,viewport_visual_layer::vehicle,2,1);
 	assert(chained.active&&chained.source_x>0.0f&&chained.source_x<1.0f&&
 		chained.progress==0.0f);
+
+	{
+	// A step with linear easing and a 200 ms duration is exactly half done after 100 ms.
+	visual_animation_managerst timed;
+	timed.set_movement_duration_ms(200);
+	timed.set_linear_easing(true);
+	std::array<int32_t,9> before{};
+	std::array<int32_t,9> after{};
+	before[1*3+1]=91;
+	after[2*3+1]=91;
+	std::array<int32_t,9> none{};
+	const int timed_viewport=0;
+	viewport_visual_animation_inputst timed_input=
+		make_input(&timed_viewport,3,none.data());
+	set_layer(timed_input,viewport_visual_layer::center,before.data(),before.data());
+	run_frame(timed,timed_input,20000);
+	set_layer(timed_input,viewport_visual_layer::center,after.data(),before.data());
+	run_frame(timed,timed_input,20010);
+	set_layer(timed_input,viewport_visual_layer::center,after.data(),before.data());
+	run_frame(timed,timed_input,20110);
+	const auto half=timed.get_movement(
+		&timed_viewport,viewport_visual_layer::center,2,1);
+	assert(half.active&&half.progress==0.5f);
+	}
 }

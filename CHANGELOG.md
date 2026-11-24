@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Adventure mode tuning, on by default (`smooth-movement adventure on|off`). While the game is in
+  adventure mode the free camera glide is switched on and tile steps use linear easing instead of
+  smoothstep. The map scrolls a tile per step there, so without the glide the player stood still on
+  screen while the world snapped, and easing in and out of every step of a run read as stutter.
+  Leaving adventure mode restores the previous camera setting. Fortress mode is unchanged.
+- Add `smooth-movement speed <ms>` (step duration, 20-500, default 100) and
+  `smooth-movement ease linear|smooth`.
+
 - Mirror creature sprites horizontally so they face their direction of travel.
   Dwarf Fortress creature art natively faces west, so only creatures moving
   east are mirrored. Facing is sticky: only horizontal movement changes it,
