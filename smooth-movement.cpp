@@ -539,10 +539,16 @@ bool inside_clip(const df::graphic_viewportst *vp,int32_t x,int32_t y)
 		y>=vp->clipy[0]&&y<=vp->clipy[1];
 }
 
+// Newer DFHack declares the spatter flag element as an opaque union, so it is accessed as raw 32-bit words.
+inline uint32_t &spatter_flag_at(const df::graphic_viewportst *vp,int32_t index)
+{
+	return reinterpret_cast<uint32_t *>(vp->screentexpos_spatter_flag)[index];
+}
+
 bool has_fire(const df::graphic_viewportst *vp,int32_t x,int32_t y)
 {
 	return vp->screentexpos_spatter_flag!=nullptr&&
-		(vp->screentexpos_spatter_flag[x*vp->dim_y+y]&fire_bits)!=0;
+		(spatter_flag_at(vp,x*vp->dim_y+y)&fire_bits)!=0;
 }
 
 template<typename T>
@@ -657,7 +663,7 @@ void with_base_suppressed(
 		vp->screentexpos_floor_flag[index],
 		vp->screentexpos_background_two[index],
 		vp->screentexpos_liquid_flag[index],
-		vp->screentexpos_spatter_flag[index],
+		spatter_flag_at(vp,index),
 		vp->screentexpos_spatter[index],
 		vp->screentexpos_ramp_flag[index],
 		vp->screentexpos_shadow_flag[index],
@@ -761,7 +767,7 @@ void draw_interface_only(
 		vp->screentexpos_floor_flag[index],
 		vp->screentexpos_background_two[index],
 		vp->screentexpos_liquid_flag[index],
-		vp->screentexpos_spatter_flag[index],
+		spatter_flag_at(vp,index),
 		vp->screentexpos_spatter[index],
 		vp->screentexpos_ramp_flag[index],
 		vp->screentexpos_shadow_flag[index],
