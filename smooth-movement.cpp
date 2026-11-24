@@ -9,10 +9,12 @@
 #include "modules/World.h"
 
 #include "df/enabler.h"
+#include "df/global_objects.h"
 #include "df/graphic.h"
 #include "df/graphic_viewportst.h"
 #include "df/renderer_2d_base.h"
 #include "df/texture_fullid.h"
+#include "df/viewport_spatter_flag.h"
 
 #include "visual_animation.h"
 
@@ -42,7 +44,7 @@ REQUIRE_GLOBAL(window_z);
 
 namespace {
 
-constexpr const char *plugin_version="0.3.1";
+constexpr const char *plugin_version="0.3.2-adv";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -1263,6 +1265,36 @@ bool has_mirrored_viewport_facing(
 	return false;
 }
 
+// Counters for `smooth-movement-adv debug`: they show whether a change is really in effect.
+uint64_t dbg_frames=0;
+uint64_t dbg_anim_frames=0;
+uint32_t dbg_runs=0;            // separate bursts of animation (roughly: tile steps)
+uint32_t dbg_run_start_ms=0;
+uint32_t dbg_last_run_ms=0;     // how long the last burst lasted
+uint32_t dbg_longest_run_ms=0;
+bool dbg_in_run=false;
+
+void debug_track_frame(uint32_t now_ms,bool animating)
+{
+	++dbg_frames;
+	if(animating)
+		{
+		++dbg_anim_frames;
+		if(!dbg_in_run)
+			{
+			dbg_in_run=true;
+			dbg_run_start_ms=now_ms;
+			++dbg_runs;
+			}
+		}
+	else if(dbg_in_run)
+		{
+		dbg_in_run=false;
+		dbg_last_run_ms=now_ms-dbg_run_start_ms;
+		dbg_longest_run_ms=std::max(dbg_longest_run_ms,dbg_last_run_ms);
+		}
+}
+
 void render_interpolated_world(df::renderer_2d_base *renderer)
 {
 	df::graphic_viewportst *vp=gps?gps->main_viewport:nullptr;
@@ -1275,6 +1307,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	for(df::graphic_viewportst *viewport:viewports)
 		animation_manager.synchronize_viewport(animation_input(viewport));
 	animation_manager.end_frame();
+	debug_track_frame(now_ms,animation_manager.requires_full_redraw());
 
 	if(!viewport_readable(vp)||renderer->sdl_renderer==nullptr)
 		return;
@@ -1465,6 +1498,32 @@ command_result status_command(
 			adventure_preset?"on":"off",preset_active?" (active now)":"");
 		return CR_OK;
 		}
+	if(parameters[0]=="debug")
+		{
+		if(parameters.size()==2&&parameters[1]=="reset")
+			{
+			dbg_frames=dbg_anim_frames=0;
+			dbg_runs=dbg_last_run_ms=dbg_longest_run_ms=0;
+			dbg_in_run=false;
+			out.print("debug counters reset\n");
+			return CR_OK;
+			}
+		out.print("== smooth-movement-adv debug ==\n");
+		out.print("version {} | enabled: {} | adventure mode: {}\n",
+			plugin_version,is_enabled?"yes":"no",World::isAdventureMode()?"yes":"no");
+		out.print("setting: speed {} ms, user-linear {}, adventure tuning {}\n",
+			step_duration_ms,linear_ease_user?"yes":"no",adventure_preset?"on":"off");
+		out.print("in effect: preset active {} | manager duration {} ms | easing {}\n",
+			preset_active?"YES":"no",animation_manager.get_movement_duration_ms(),
+			animation_manager.get_linear_easing()?"linear":"smooth");
+		out.print("free camera: {} (preset saved previous camera: {})\n",
+			camera_enabled?"on":"off",preset_saved_camera?"on":"off");
+		out.print("frames seen {} | frames animating {} | animation bursts {}\n",
+			dbg_frames,dbg_anim_frames,dbg_runs);
+		out.print("last burst {} ms | longest burst {} ms\n",dbg_last_run_ms,dbg_longest_run_ms);
+		out.print("Walk a few steps, then run this again; 'debug reset' clears the counters.\n");
+		return CR_OK;
+		}
 	if(parameters[0]=="speed")
 		{
 		if(parameters.size()==1)
@@ -1618,7 +1677,7 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 		"smooth-movement-adv",
 		"Smooth movement status; free camera: camera on|off|reset|<fx> <fy>; "
 		"sprite flipping: flip on|off; step duration: speed <ms>; "
-		"easing: ease linear|smooth; adventure mode tuning: adventure on|off.",
+		"easing: ease linear|smooth; adventure mode tuning: adventure on|off; self-check: debug [reset].",
 		status_command);
 	return CR_OK;
 }
