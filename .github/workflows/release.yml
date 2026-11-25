@@ -4,13 +4,21 @@ on:
   push:
     tags:
       - '*'
+    branches:
+      - '**'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v5
 
@@ -37,6 +45,7 @@ jobs:
           cp CMakeLists.txt smooth-movement.cpp test_visual_animation_manager.cpp visual_animation.h dfhack/plugins/external/smooth-movement-adv/
 
       - name: Build Linux plugin
+        timeout-minutes: 30
         run: |
           cmake -S dfhack -B dfhack/build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_DOCS=OFF
           cmake --build dfhack/build/linux --target smooth-movement-adv 2>&1 | tee build.log
@@ -64,6 +73,7 @@ jobs:
           path: diag/
 
       - name: Build Windows plugin
+        timeout-minutes: 40
         run: |
           # An unrelated DFHack plugin (logistics) can fail to link on the runner; only our DLL matters.
           (cd dfhack/build && ./build-win64-from-linux.sh) || echo "full build reported errors; checking for our DLL"
@@ -75,7 +85,7 @@ jobs:
         env:
           DFHACK_TAG: ${{ steps.dfhack.outputs.tag }}
         run: |
-          release_tag="$GITHUB_REF_NAME-dfhack-$DFHACK_TAG"
+          release_tag="${GITHUB_REF_NAME//\//-}-dfhack-$DFHACK_TAG"
           mkdir -p release/linux/hack/plugins release/windows/hack/plugins
           install -m755 dfhack/build/linux/plugins/external/smooth-movement-adv/smooth-movement-adv.plug.so release/linux/hack/plugins/
           install -m755 "$(find dfhack/build -name smooth-movement-adv.plug.dll | head -1)" release/windows/hack/plugins/
@@ -83,7 +93,14 @@ jobs:
           (cd release/windows && zip -q -r "../smooth-movement-$release_tag-windows-x86_64.zip" hack)
           for archive in release/*.zip; do unzip -t "$archive"; done
 
+      - name: Save the build as a downloadable file
+        uses: actions/upload-artifact@v4
+        with:
+          name: smooth-movement-adv-windows
+          path: release/smooth-movement-*-windows-x86_64.zip
+
       - name: Upload release assets
+        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
