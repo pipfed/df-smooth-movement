@@ -21,6 +21,7 @@
 
 #include "visual_animation.h"
 
+#include <SDL_events.h>
 #include <SDL_render.h>
 
 #include <algorithm>
@@ -49,7 +50,7 @@ REQUIRE_GLOBAL(world);
 
 namespace {
 
-constexpr const char *plugin_version="0.9.0-adv";
+constexpr const char *plugin_version="0.10.0-adv";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -270,12 +271,40 @@ void compensate_mouse(
 }
 
 // Gives the game its own values back (plugin disabled).
-// The last frame's camera offset, so the compensation can also run from the game's update tick.
+// --- mouse via SDL events ---------------------------------------------------------------------
+// The game reads the mouse before our render hook runs, so editing its mouse fields there is too
+// late. DFHack passes every SDL event to plugins before the game sees it, so mouse events over the
+// map are shifted here by the camera's sub-tile offset: the game then works out the tile under the
+// pointer from a position that already matches the shifted picture. WORKAROUND: this edits the
+// mouse events' pixel positions, not a game feature. Not applied while middle-mouse panning.
+bool sdl_mouse_seen=false;            // the event hook has been called at least once
+double sdl_mouse_scale=1.0;           // window pixels per render pixel (`camera mouse <scale>`)
+uint32_t dbg_sdl_events=0;
+uint32_t dbg_sdl_shifted=0;
+int32_t dbg_sdl_dx=0,dbg_sdl_dy=0;
 int32_t last_glide_x=0;
 int32_t last_glide_y=0;
 const df::renderer_2d_base *last_renderer=nullptr;
 const df::graphic_viewportst *last_vp=nullptr;
+bool last_drag=false;
 
+void shift_mouse_event(int32_t &x,int32_t &y)
+{
+	++dbg_sdl_events;
+	if(last_renderer==nullptr||last_vp==nullptr||last_drag)return;
+	if(last_glide_x==0&&last_glide_y==0)return;
+	const double tile=tile_px(last_renderer);
+	const double tx=std::floor((double(x)/sdl_mouse_scale-double(last_renderer->origin_x))/tile);
+	const double ty=std::floor((double(y)/sdl_mouse_scale-double(last_renderer->origin_y))/tile);
+	if(tx<last_vp->clipx[0]||tx>last_vp->clipx[1]||ty<last_vp->clipy[0]||ty>last_vp->clipy[1])return;
+	dbg_sdl_dx=int32_t(std::lround(double(last_glide_x)*sdl_mouse_scale));
+	dbg_sdl_dy=int32_t(std::lround(double(last_glide_y)*sdl_mouse_scale));
+	x-=dbg_sdl_dx;
+	y-=dbg_sdl_dy;
+	++dbg_sdl_shifted;
+}
+
+// The last frame's camera offset, so the compensation can also run from the game's update tick.
 void restore_mouse()
 {
 	if(gps==nullptr||!mouse_comp.has)return;
@@ -396,6 +425,31 @@ void attribute_landed(int32_t ax,int32_t ay,double tile)
 		}
 }
 
+// The end of the unit's remaining path (the walk's destination) when its path vectors exist in
+// this DFHack version. Detected at compile time so a different layout can't break the build.
+struct path_endst
+{
+	bool ok=false;
+	int32_t x=0,y=0,z=0;
+	size_t n=0;
+	int32_t fx=0,fy=0,fz=0;   // first element
+};
+template<class P>
+auto path_end_of(const P &p,int)->decltype(p.path.x.size(),p.path.y.size(),p.path.z.size(),path_endst())
+{
+	path_endst r;
+	r.n=p.path.x.size();
+	if(r.n>0&&p.path.y.size()==r.n&&p.path.z.size()==r.n)
+		{
+		r.ok=true;
+		r.fx=p.path.x[0];r.fy=p.path.y[0];r.fz=p.path.z[0];
+		r.x=p.path.x[r.n-1];r.y=p.path.y[r.n-1];r.z=p.path.z[r.n-1];
+		}
+	return r;
+}
+template<class P>
+path_endst path_end_of(const P &,long){return path_endst();}
+
 // While the character walks to a click-to-move destination, the camera moves on its own: a
 // continuous position travels along the straight line from where it started to the destination at
 // the walking speed, and the world is drawn offset by (game view - camera). The character's tile
@@ -414,9 +468,22 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 		{line_follow.active=false;return false;}
 	const df::unit *adv=world->units.active[0];
 	if(adv==nullptr){line_follow.active=false;return false;}
-	const int32_t dest_x=adv->path.dest.x;
-	const int32_t dest_y=adv->path.dest.y;
-	const bool travelling=dest_x!=-30000&&adv->path.dest.z==adv->pos.z&&
+	int32_t dest_x=adv->path.dest.x;
+	int32_t dest_y=adv->path.dest.y;
+	int32_t dest_z=adv->path.dest.z;
+	if(dest_x==-30000)
+		{
+		// no destination recorded: use the far end of the remaining path
+		const path_endst pe=path_end_of(adv->path,0);
+		if(pe.ok)
+			{
+			const int32_t d_last=std::abs(pe.x-adv->pos.x)+std::abs(pe.y-adv->pos.y);
+			const int32_t d_first=std::abs(pe.fx-adv->pos.x)+std::abs(pe.fy-adv->pos.y);
+			if(d_last>=d_first){dest_x=pe.x;dest_y=pe.y;dest_z=pe.z;}
+			else{dest_x=pe.fx;dest_y=pe.fy;dest_z=pe.fz;}
+			}
+		}
+	const bool travelling=dest_x!=-30000&&dest_z==adv->pos.z&&
 		(dest_x!=adv->pos.x||dest_y!=adv->pos.y);
 	if(dest_x!=-30000)++dbg_dest_seen;
 	if(!travelling){line_follow.active=false;line_follow.dest_x=-30000;return false;}
@@ -1620,7 +1687,9 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	last_glide_y=glide_y;
 	last_renderer=renderer;
 	last_vp=vp;
-	compensate_mouse(renderer,vp,glide_x,glide_y,enabler!=nullptr&&enabler->mouse_mbut);
+	last_drag=enabler!=nullptr&&enabler->mouse_mbut;
+	if(!sdl_mouse_seen)
+		compensate_mouse(renderer,vp,glide_x,glide_y,last_drag);
 	if(!glide&&camera_was_offset)
 		{
 		// The camera just re-joined the grid: one engine redraw replaces the last shifted frame.
@@ -1781,6 +1850,7 @@ void reset_state()
 	line_camera=true;
 	line_follow=line_followst{};
 	line_lead_tiles=6.0;
+	sdl_mouse_scale=1.0;
 	effective_step_ms=100;
 	step_interval_ema=0.0;
 	last_land_ms=0;
@@ -1793,21 +1863,32 @@ void reset_state()
 void print_help(color_ostream &out)
 {
 out.print(
-"smooth-movement-adv commands (all are 'smooth-movement-adv <command>'):\n"
-"  help                          this list\n"
-"  (nothing)                     show the current status\n"
-"  debug [reset]                 self-check numbers: settings in effect, step and camera counters\n"
-"  speed <20-500>                shortest time a tile step takes, in ms (default 100)\n"
-"  ease linear|smooth            easing of the step animation (default smooth)\n"
-"  adaptive on|off               stretch steps to how often they really arrive (default on)\n"
-
-"  camera on|off|reset           free camera: on (default), off, or clear its sub-tile offset\n"
-"  camera <fx> <fy>              park the camera at an offset in tiles (-0.99..0.99)\n"
-"  camera line on|off            glide in a straight line to a click-to-move destination (default on)\n"
-"  camera lead <tiles>           how far ahead of the character the camera may run and wait (default 6)\n"
-"  camera speed <20-1000>|auto   camera glide time per tile in ms; auto follows the step speed\n"
-"  camera ease linear|smooth|auto   camera glide easing; auto follows the step easing (default smooth)\n"
-"  flip on|off                   flip creature sprites toward their direction of travel\n"
+"smooth-movement-adv <command>\n"
+"\n"
+"General\n"
+"  help                    this list\n"
+"  (no command)            show the current status\n"
+"  debug [reset]           self-check numbers; 'reset' clears the counters\n"
+"\n"
+"Steps\n"
+"  speed <20-500>          shortest time a step takes, ms (default 100)\n"
+"  ease linear|smooth      step easing (default smooth)\n"
+"  adaptive on|off        match step time to how often steps arrive (on)\n"
+"  flip on|off             turn creature sprites toward travel (off)\n"
+"\n"
+"Camera\n"
+"  camera on|off|reset     free camera (default on); reset clears its offset\n"
+"  camera <fx> <fy>        park the camera at an offset in tiles (-0.99..0.99)\n"
+"  camera line on|off      straight-line glide to a click-to-move target (on)\n"
+"  camera lead <tiles>     how far ahead of the character the camera may\n"
+"                          run and wait (default 6)\n"
+"  camera speed <20-1000>|auto\n"
+"                          camera time per tile, ms (auto = step speed)\n"
+"  camera ease linear|smooth|auto\n"
+"                          camera easing (auto = step easing)\n"
+"  camera mouse <scale>    mouse offset scale (default 1.00); only change it\n"
+"                          if clicks are off, e.g. 2.00 or 0.50\n"
+"\n"
 "Settings reset to their defaults whenever the plugin is enabled.\n");
 }
 
@@ -1866,6 +1947,9 @@ return CR_OK;
 			const df::unit *a=world->units.active[0];
 			out.print("adventurer at {} {} {} | path dest {} {} {}\n",
 				a->pos.x,a->pos.y,a->pos.z,a->path.dest.x,a->path.dest.y,a->path.dest.z);
+			const path_endst pe=path_end_of(a->path,0);
+			out.print("path vectors: {} | length {} | first {} {} {} | last {} {} {}\n",
+				pe.ok?"present":"empty or not in this version",pe.n,pe.fx,pe.fy,pe.fz,pe.x,pe.y,pe.z);
 			}
 		out.print("camera speed setting: {} | camera easing setting: {}\n",
 		cam_speed_ms==0?std::string("auto"):std::to_string(cam_speed_ms)+" ms",
@@ -1879,6 +1963,10 @@ return CR_OK;
 		out.print("frames seen {} | frames animating {} | animation bursts {}\n",
 			dbg_frames,dbg_anim_frames,dbg_runs);
 		out.print("last burst {} ms | longest burst {} ms\n",dbg_last_run_ms,dbg_longest_run_ms);
+		out.print("mouse via SDL events: hook {} | events {} | shifted {} | last shift {} {} px | scale {:.2f}\n",
+			sdl_mouse_seen?"called":"NOT called (using field edits)",dbg_sdl_events,dbg_sdl_shifted,
+			dbg_sdl_dx,dbg_sdl_dy,sdl_mouse_scale);
+		out.print("camera offset now: {} {} px\n",last_glide_x,last_glide_y);
 		out.print("mouse compensation: tile shift {} {} (0 0 when the view is not offset)\n",
 			dbg_mouse_dx,dbg_mouse_dy);
 		out.print("camera: scrolls {} | landed {} | waits {} | drag frames {}\n",
@@ -1970,6 +2058,24 @@ return CR_OK;
 	line_camera=parameters[2]=="on";
 	line_follow.active=false;
 	out.print("smooth-movement-adv: straight-line camera {}\n",parameters[2]);
+	return CR_OK;
+	}
+	return CR_WRONG_USAGE;
+	}
+	if(parameters.size()>=2&&parameters[1]=="mouse")
+	{
+	if(parameters.size()==2)
+	{
+	out.print("mouse scale: {:.2f} (window pixels per render pixel)\n",sdl_mouse_scale);
+	return CR_OK;
+	}
+	if(parameters.size()==3)
+	{
+	char *end=nullptr;
+	const double v=std::strtod(parameters[2].c_str(),&end);
+	if(end==parameters[2].c_str()||*end!='\0'||v<0.25||v>4.0)return CR_WRONG_USAGE;
+	sdl_mouse_scale=v;
+	out.print("smooth-movement-adv: mouse scale {:.2f}\n",v);
 	return CR_OK;
 	}
 	return CR_WRONG_USAGE;
@@ -2143,7 +2249,7 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 		"smooth-movement-adv",
 		"Smooth movement status; free camera: camera on|off|reset|<fx> <fy>; "
 		"sprite flipping: flip on|off; step duration: speed <ms>; "
-		"easing: ease linear|smooth; straight-line camera: camera line on|off, camera lead <tiles>; camera speed and easing: camera speed <ms>|auto, camera ease linear|smooth|auto; self-check: debug [reset]; full list: help.",
+		"easing: ease linear|smooth; straight-line camera: camera line on|off, camera lead <tiles>, camera mouse <scale>; camera speed and easing: camera speed <ms>|auto, camera ease linear|smooth|auto; self-check: debug [reset]; full list: help.",
 		status_command);
 	return CR_OK;
 }
@@ -2168,6 +2274,7 @@ DFhackCExport command_result plugin_enable(color_ostream &out,bool enable)
 		restore_mouse();
 		last_renderer=nullptr;
 		last_vp=nullptr;
+		sdl_mouse_seen=false;
 		reset_state();
 		clear_sdl_bindings();
 		if(gps!=nullptr)++gps->force_full_display_count;
@@ -2182,9 +2289,34 @@ DFhackCExport command_result plugin_enable(color_ostream &out,bool enable)
 // game's mouse fields, as before, just earlier.
 DFhackCExport command_result plugin_onupdate(color_ostream &)
 {
-	if(is_enabled&&camera_enabled&&last_renderer!=nullptr&&last_vp!=nullptr&&gps!=nullptr)
+	if(!sdl_mouse_seen&&is_enabled&&camera_enabled&&last_renderer!=nullptr&&last_vp!=nullptr&&gps!=nullptr)
 		compensate_mouse(last_renderer,last_vp,last_glide_x,last_glide_y,
 			enabler!=nullptr&&enabler->mouse_mbut);
+	return CR_OK;
+}
+
+DFhackCExport command_result plugin_sdl_event(color_ostream &,SDL_Event *event)
+{
+	if(event==nullptr||!is_enabled||!camera_enabled)return CR_OK;
+	if(!sdl_mouse_seen)
+		{
+		sdl_mouse_seen=true;
+		restore_mouse();   // the event path takes over from the field edits
+		}
+	if(event->type==SDL_MOUSEMOTION)
+		{
+		int32_t x=event->motion.x,y=event->motion.y;
+		shift_mouse_event(x,y);
+		event->motion.x=x;
+		event->motion.y=y;
+		}
+	else if(event->type==SDL_MOUSEBUTTONDOWN||event->type==SDL_MOUSEBUTTONUP)
+		{
+		int32_t x=event->button.x,y=event->button.y;
+		shift_mouse_event(x,y);
+		event->button.x=x;
+		event->button.y=y;
+		}
 	return CR_OK;
 }
 
