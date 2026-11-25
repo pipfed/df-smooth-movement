@@ -135,6 +135,11 @@ struct viewport_visual_animation_inputst
 	// Only a hint: it changes at input time, the buffers shift on a later render frame.
 	int32_t pan_x=0;
 	int32_t pan_y=0;
+	// Optional terrain buffers (the floor layer). A lone character walking in adventure mode never
+	// moves on screen -- the map scrolls under it -- so the sprites alone cannot show that a scroll
+	// landed; the ground can. Null leaves detection on sprites only.
+	const int32_t *anchor_current=nullptr;
+	const int32_t *anchor_previous=nullptr;
 
 	bool valid() const
 		{
@@ -320,8 +325,16 @@ class visual_animation_managerst
 				hash=(hash^uint64_t(uint32_t(input.current[layer][i])))*fnv_prime;
 				hash=(hash^uint64_t(uint32_t(input.previous[layer][i])))*fnv_prime;
 				}
-			}
-		return hash;
+				}
+				if(input.anchor_current!=nullptr&&input.anchor_previous!=nullptr)
+				{
+				for(int32_t i=0;i<tile_count;++i)
+				{
+				hash=(hash^uint64_t(uint32_t(input.anchor_current[i])))*fnv_prime;
+				hash=(hash^uint64_t(uint32_t(input.anchor_previous[i])))*fnv_prime;
+				}
+				}
+				return hash;
 		}
 
 	// Fraction of tracked sprites consistent with a buffer shift: current[x]==previous[x+dwx].
@@ -360,6 +373,33 @@ class visual_animation_managerst
 		if(considered==0)return -1.0;
 		return double(matches)/double(considered);
 		}
+
+	// Same test as shift_match_ratio, on the terrain buffer. Negative when there is nothing to compare.
+	static double anchor_match_ratio(
+	const viewport_visual_animation_inputst &input,
+	int32_t dwx,
+	int32_t dwy)
+	{
+	if(input.anchor_current==nullptr||input.anchor_previous==nullptr)return -1.0;
+	int32_t considered=0;
+	int32_t matches=0;
+	for(int32_t x=0;x<input.dim_x;++x)
+	{
+	const int32_t sx=x+dwx;
+	if(sx<0||sx>=input.dim_x)continue;
+	for(int32_t y=0;y<input.dim_y;++y)
+	{
+	const int32_t sy=y+dwy;
+	if(sy<0||sy>=input.dim_y)continue;
+	const int32_t texpos=input.anchor_current[x*input.dim_y+y];
+	if(texpos==0)continue;
+	++considered;
+	if(input.anchor_previous[sx*input.dim_y+sy]==texpos)++matches;
+	}
+	}
+	if(considered==0)return -1.0;
+	return double(matches)/double(considered);
+	}
 
 	static std::array<int32_t,2> shared_movement_delta(
 		const int32_t *current,
@@ -552,7 +592,16 @@ class visual_animation_managerst
 					// A prefix netting to zero is indistinguishable from "nothing landed yet".
 					// Accepting it would retire shifts the buffers have still to apply.
 					if(shift[0]==0&&shift[1]==0)continue;
-					const double ratio=shift_match_ratio(input,shift[0],shift[1]);
+					double ratio=shift_match_ratio(input,shift[0],shift[1]);
+					if(ratio<0.5)
+					{
+					// Too few sprites to vote (a lone character stays put on screen while the map scrolls
+					// under it), so let the ground decide. If the ground fits the shift no worse than it fits
+					// "nothing moved", the scroll has landed.
+					const double ground=anchor_match_ratio(input,shift[0],shift[1]);
+					if(ground>=0.9&&ground>=anchor_match_ratio(input,0,0))
+					ratio=std::max(ratio,ground);
+					}
 					// Emptiness is per-prefix: a long one can push every sprite out of range
 					// while a shorter one still has something to say.
 					if(ratio<0.0)continue;
