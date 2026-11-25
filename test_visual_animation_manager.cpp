@@ -761,4 +761,37 @@ int main()
 		&timed_viewport,viewport_visual_layer::center,2,1);
 	assert(half.active&&half.progress==0.5f);
 	}
+
+	{
+	// A lone character stays on the same screen tile while the map scrolls under it (adventure
+	// mode). With no other sprites to vote, only the terrain can show the scroll landed; the
+	// character's step must still be animated.
+	constexpr int32_t dim=6;
+	std::array<int32_t,dim*dim> none{};
+	std::array<int32_t,dim*dim> player{};
+	player[2*dim+2]=55;
+	std::array<int32_t,dim*dim> ground_before{};
+	std::array<int32_t,dim*dim> ground_after{};
+	for(int32_t x=0;x<dim;++x)
+		for(int32_t y=0;y<dim;++y)
+			ground_before[x*dim+y]=100+x*7+y*3;
+	for(int32_t x=0;x<dim;++x)
+		for(int32_t y=0;y<dim;++y)
+			ground_after[x*dim+y]=(x+1<dim)?ground_before[(x+1)*dim+y]:999;
+	const int lone_token=0;
+	visual_animation_managerst lone;
+	auto input=make_input(&lone_token,dim,none.data());
+	input.anchor_current=ground_before.data();
+	input.anchor_previous=ground_before.data();
+	set_layer(input,viewport_visual_layer::center,player.data(),player.data());
+	run_frame(lone,input,30000);
+	input.pan_x=1;                          // the scroll is announced; buffers not yet redrawn
+	run_frame(lone,input,30016);
+	input.anchor_current=ground_after.data();   // the redraw lands: ground shifted by one tile
+	input.anchor_previous=ground_before.data();
+	run_frame(lone,input,30032);
+	const auto step=lone.get_movement(&lone_token,viewport_visual_layer::center,2,2);
+	assert(step.active);
+	assert(step.source_x==1.0f&&step.source_y==2.0f);
+	}
 }
