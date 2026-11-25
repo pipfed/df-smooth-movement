@@ -51,7 +51,7 @@ REQUIRE_GLOBAL(world);
 
 namespace {
 
-constexpr const char *plugin_version="0.10.1-adv";
+constexpr const char *plugin_version="0.10.2-adv";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -199,6 +199,13 @@ struct line_followst
 };
 line_followst line_follow;
 double line_lead_tiles=6.0;                  // `camera lead <tiles>`: how far ahead of the character the camera may wait
+
+// The unit the player controls in adventure mode. (world->units.active[0] is NOT reliably the
+// adventurer: a trace showed it standing still while the player walked.)
+const df::unit *player_unit()
+{
+	return world!=nullptr?world->units.adv_unit:nullptr;
+}
 
 double tile_px(const df::renderer_2d_base *renderer)
 {
@@ -465,9 +472,9 @@ double smooth01(double t)
 
 bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t dt)
 {
-	if(!line_camera||world==nullptr||!World::isAdventureMode()||world->units.active.empty())
+	if(!line_camera||world==nullptr||!World::isAdventureMode())
 		{line_follow.active=false;return false;}
-	const df::unit *adv=world->units.active[0];
+	const df::unit *adv=player_unit();
 	if(adv==nullptr){line_follow.active=false;return false;}
 	int32_t dest_x=adv->path.dest.x;
 	int32_t dest_y=adv->path.dest.y;
@@ -587,9 +594,9 @@ void trace_frame(uint32_t now_ms,int32_t wx,int32_t wy)
 {
 	if(!trace_on||trace_rows.size()>=trace_max_rows)return;
 	double px=0,py=0,dx=-30000,dy=-30000;
-	if(world!=nullptr&&!world->units.active.empty()&&world->units.active[0]!=nullptr)
+	if(player_unit()!=nullptr)
 		{
-		const df::unit *a=world->units.active[0];
+		const df::unit *a=player_unit();
 		px=a->pos.x;py=a->pos.y;dx=a->path.dest.x;dy=a->path.dest.y;
 		}
 	trace_rows.push_back({double(now_ms),px,py,dx,dy,double(wx),double(wy),
@@ -1984,9 +1991,9 @@ return CR_OK;
 		line_camera?"on":"off",line_follow.active?"YES":"no",line_follow.ex,line_follow.ey);
 		out.print("line camera: walks started {} | frames driven {} | frames with a destination {}\n",
 			dbg_line_starts,dbg_line_frames,dbg_dest_seen);
-		if(world!=nullptr&&!world->units.active.empty()&&world->units.active[0]!=nullptr)
+		if(player_unit()!=nullptr)
 			{
-			const df::unit *a=world->units.active[0];
+			const df::unit *a=player_unit();
 			out.print("adventurer at {} {} {} | path dest {} {} {}\n",
 				a->pos.x,a->pos.y,a->pos.z,a->path.dest.x,a->path.dest.y,a->path.dest.z);
 			const path_endst pe=path_end_of(a->path,0);
