@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <set>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -50,7 +51,7 @@ REQUIRE_GLOBAL(world);
 
 namespace {
 
-constexpr const char *plugin_version="0.10.0-adv";
+constexpr const char *plugin_version="0.10.1-adv";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -573,6 +574,45 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 		}
 	transient_x=tx;
 	transient_y=ty;
+	return true;
+}
+
+// --- trace (`smooth-movement-adv trace`) -----------------------------------------------------
+// Records one row per frame so the camera's real path can be inspected afterwards.
+bool trace_on=false;
+std::vector<std::array<double,16>> trace_rows;
+constexpr size_t trace_max_rows=20000;
+
+void trace_frame(uint32_t now_ms,int32_t wx,int32_t wy)
+{
+	if(!trace_on||trace_rows.size()>=trace_max_rows)return;
+	double px=0,py=0,dx=-30000,dy=-30000;
+	if(world!=nullptr&&!world->units.active.empty()&&world->units.active[0]!=nullptr)
+		{
+		const df::unit *a=world->units.active[0];
+		px=a->pos.x;py=a->pos.y;dx=a->path.dest.x;dy=a->path.dest.y;
+		}
+	trace_rows.push_back({double(now_ms),px,py,dx,dy,double(wx),double(wy),
+		double(camera_pending_dx),double(camera_pending_dy),transient_x,transient_y,
+		rest_x,rest_y,line_follow.active?1.0:0.0,line_follow.cam_x,line_follow.cam_y});
+}
+
+bool trace_save(color_ostream &out)
+{
+	const char *path="dfhack-config/smooth-movement-adv-trace.csv";
+	std::ofstream f(path);
+	if(!f)
+		{
+		out.printerr("smooth-movement-adv: could not write {}\n",path);
+		return false;
+		}
+	f<<"ms,char_x,char_y,dest_x,dest_y,window_x,window_y,pending_dx,pending_dy,"
+		"transient_x_px,transient_y_px,rest_x,rest_y,line_active,cam_x,cam_y\n";
+	for(const auto &r:trace_rows)
+		{
+		for(size_t i=0;i<r.size();++i)f<<r[i]<<(i+1<r.size()?",":"\n");
+		}
+	out.print("smooth-movement-adv: wrote {} frames to {}\n",trace_rows.size(),path);
 	return true;
 }
 
@@ -1679,6 +1719,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	if(!viewport_readable(vp)||renderer->sdl_renderer==nullptr)
 		return;
 	update_camera(renderer,vp,animation_manager.get_frame_delta_ms());
+	trace_frame(now_ms,window_x?*window_x:0,window_y?*window_y:0);
 	const double cam_tile=tile_px(renderer);
 	const int32_t glide_x=int32_t(std::lround(transient_x+rest_x*cam_tile));
 	const int32_t glide_y=int32_t(std::lround(transient_y+rest_y*cam_tile));
@@ -1869,6 +1910,7 @@ out.print(
 "  help                    this list\n"
 "  (no command)            show the current status\n"
 "  debug [reset]           self-check numbers; 'reset' clears the counters\n"
+"  trace start|stop        record every frame of a walk to a CSV file\n"
 "\n"
 "Steps\n"
 "  speed <20-500>          shortest time a step takes, ms (default 100)\n"
@@ -2043,6 +2085,19 @@ return CR_OK;
 		return CR_WRONG_USAGE;
 		}
 	
+	if(parameters[0]=="trace")
+	{
+	if(parameters.size()!=2||(parameters[1]!="start"&&parameters[1]!="stop"))return CR_WRONG_USAGE;
+	if(parameters[1]=="start")
+		{
+		trace_rows.clear();
+		trace_on=true;
+		out.print("smooth-movement-adv: recording; walk somewhere, then run 'trace stop'\n");
+		return CR_OK;
+		}
+	trace_on=false;
+	return trace_save(out)?CR_OK:CR_FAILURE;
+	}
 	if(parameters[0]=="camera")
 	{
 	if(parameters.size()>=2&&parameters[1]=="line")
@@ -2249,7 +2304,7 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 		"smooth-movement-adv",
 		"Smooth movement status; free camera: camera on|off|reset|<fx> <fy>; "
 		"sprite flipping: flip on|off; step duration: speed <ms>; "
-		"easing: ease linear|smooth; straight-line camera: camera line on|off, camera lead <tiles>, camera mouse <scale>; camera speed and easing: camera speed <ms>|auto, camera ease linear|smooth|auto; self-check: debug [reset]; full list: help.",
+		"easing: ease linear|smooth; straight-line camera: camera line on|off, camera lead <tiles>, camera mouse <scale>; camera speed and easing: camera speed <ms>|auto, camera ease linear|smooth|auto; self-check: debug [reset], trace start|stop; full list: help.",
 		status_command);
 	return CR_OK;
 }
