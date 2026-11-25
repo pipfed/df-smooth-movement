@@ -44,7 +44,7 @@ REQUIRE_GLOBAL(window_z);
 
 namespace {
 
-constexpr const char *plugin_version="0.3.2-adv";
+constexpr const char *plugin_version="0.4.0-adv";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -80,7 +80,18 @@ bool adventure_preset=true;          // `smooth-movement-adv adventure on|off`
 bool preset_active=false;
 bool preset_saved_camera=false;
 
+// Camera counters for `smooth-movement-adv debug`.
+uint32_t dbg_cam_scrolls=0;      // window scrolls observed
+uint32_t dbg_cam_landed=0;       // scrolls matched to the buffers (smooth)
+uint32_t dbg_cam_waits=0;        // frames spent waiting for the buffers to catch up
+uint32_t dbg_cam_timeouts=0;     // gave up matching (a jerk can follow)
+uint32_t dbg_cam_nodata=0;       // nothing to match against (a jerk can follow)
+uint32_t dbg_cam_overflow=0;     // scrolled too far to follow, snapped
+uint32_t dbg_cam_jumps=0;        // teleport-like jumps, snapped
+uint32_t dbg_cam_drag_frames=0;  // frames spent middle-mouse dragging
+
 void apply_animation_settings()
+
 {
 	animation_manager.set_movement_duration_ms(step_duration_ms);
 	animation_manager.set_linear_easing(linear_ease_user||preset_active);
@@ -263,12 +274,16 @@ void update_camera(
 		const int32_t dy=wy-camera_prev_wy;
 		if((std::abs(dx)>camera_max_glide_tiles||std::abs(dy)>camera_max_glide_tiles)&&
 			!drag_active)
+			{
 			cancel_camera_transients();   // teleport-like jump (recenter/minimap): snap
+			++dbg_cam_jumps;
+			}
 		else
 			{
 			camera_pending_dx+=dx;
 			camera_pending_dy+=dy;
 			camera_pending_frames=0;
+			++dbg_cam_scrolls;
 			}
 		}
 	camera_prev_wx=wx;
@@ -283,8 +298,9 @@ void update_camera(
 			transient_x=0.0;
 			transient_y=0.0;
 			clear_camera_pending();
+			++dbg_cam_overflow;
 			}
-		else
+			else
 			{
 			// Fast scrolling applies the pending delta PIECEMEAL: the buffers may hold +1 of a
 			// pending +3 this frame. Testing only the total made landings miss, time out, and
@@ -317,10 +333,12 @@ void update_camera(
 				{
 				// Nothing to compare against (empty background): give up on attribution.
 				clear_camera_pending();
+				++dbg_cam_nodata;
 				}
 			else if(best_mag>0)
 				{
 				attribute_landed(best_ax,best_ay,tile);
+				++dbg_cam_landed;
 				camera_pending_dx-=best_ax;
 				camera_pending_dy-=best_ay;
 				camera_pending_frames=0;
@@ -329,12 +347,14 @@ void update_camera(
 				{
 				// Content demonstrably hasn't moved yet: keep waiting, no timeout pressure.
 				camera_pending_frames=0;
+				++dbg_cam_waits;
 				}
 			else if(++camera_pending_frames>4)
 				{
 				// Neither static nor any prefix recognizable (heavy simultaneous change):
 				// drop the debt without touching the in-flight glide.
 				clear_camera_pending();
+				++dbg_cam_timeouts;
 				}
 			}
 		}
@@ -358,6 +378,7 @@ void update_camera(
 		}
 	if(drag_active)
 		{
+		++dbg_cam_drag_frames;
 		if(!mbut)
 			{
 			drag_active=false;
@@ -385,9 +406,23 @@ void update_camera(
 
 	if(transient_x!=0.0||transient_y!=0.0)
 		{
+		if(preset_active||linear_ease_user)
+		{
+		// Constant-speed catch-up at one tile per step duration, so the world scrolls at the same
+		// pace the character walks and the character stays put on screen. (An exponential
+		// decay starts fast and slows down, which reads as a jerk on every step.)
+		const double mag=std::hypot(transient_x,transient_y);
+		const double step=tile*double(delta_ms)/double(std::max<uint32_t>(step_duration_ms,1));
+		const double scale=mag<=step?0.0:(mag-step)/mag;
+		transient_x*=scale;
+		transient_y*=scale;
+		}
+		else
+		{
 		const double k=std::exp(-double(delta_ms)/camera_tau_ms);
 		transient_x*=k;
 		transient_y*=k;
+		}
 		if(std::abs(transient_x)<0.5&&std::abs(transient_y)<0.5)
 			{
 			transient_x=0.0;
@@ -1505,6 +1540,8 @@ command_result status_command(
 			dbg_frames=dbg_anim_frames=0;
 			dbg_runs=dbg_last_run_ms=dbg_longest_run_ms=0;
 			dbg_in_run=false;
+			dbg_cam_scrolls=dbg_cam_landed=dbg_cam_waits=dbg_cam_timeouts=0;
+			dbg_cam_nodata=dbg_cam_overflow=dbg_cam_jumps=dbg_cam_drag_frames=0;
 			out.print("debug counters reset\n");
 			return CR_OK;
 			}
@@ -1521,6 +1558,10 @@ command_result status_command(
 		out.print("frames seen {} | frames animating {} | animation bursts {}\n",
 			dbg_frames,dbg_anim_frames,dbg_runs);
 		out.print("last burst {} ms | longest burst {} ms\n",dbg_last_run_ms,dbg_longest_run_ms);
+		out.print("camera: scrolls {} | landed {} | waits {} | drag frames {}\n",
+		dbg_cam_scrolls,dbg_cam_landed,dbg_cam_waits,dbg_cam_drag_frames);
+		out.print("camera misses (each can jerk): timeouts {} | no-data {} | too-far {} | jumps {}\n",
+		dbg_cam_timeouts,dbg_cam_nodata,dbg_cam_overflow,dbg_cam_jumps);
 		out.print("Walk a few steps, then run this again; 'debug reset' clears the counters.\n");
 		return CR_OK;
 		}
