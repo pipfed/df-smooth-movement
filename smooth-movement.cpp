@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <set>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <type_traits>
@@ -51,7 +52,7 @@ REQUIRE_GLOBAL(world);
 
 namespace {
 
-constexpr const char *plugin_version="0.10.5-adv";
+constexpr const char *plugin_version="0.11.0-adv";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -198,9 +199,19 @@ struct line_followst
 	double ref_ms=0.0;
 	double elapsed_ms=0.0;
 	bool finishing=false;                    // the walk ended: glide the rest of the way to the game's view
+	double start_px=0.0,start_py=0.0;        // the character's tile when the walk began
+	double d0=1.0;                           // its distance to the destination then
+	double pan_tiles=0.0;                    // how far the camera was panned off the character
+	double tween_ms=0.0;                     // short walks: the camera's journey takes this long
+	double hold_ms=0.0;                      // time spent waiting for the game to re-centre
 	int32_t dest_x=-30000,dest_y=-30000;
 };
 line_followst line_follow;
+// Where the game's view sits relative to the character when it is centred on them (window minus
+// character, in tiles). Starts as half the map view and is refined while standing still.
+double centered_off_x=0.0,centered_off_y=0.0;
+bool centered_valid=false;
+double centered_idle_ms=0.0;
 double line_lead_tiles=6.0;                  // `camera lead <tiles>`: how far ahead of the character the camera may wait
 
 // The unit the player controls in adventure mode. (world->units.active[0] is NOT reliably the
@@ -333,10 +344,75 @@ void restore_mouse()
 
 // Match ratio of "buffers shifted by (dwx,dwy)" on the background layer: 0..1, or -1 when there
 // is nothing to compare (empty background).
+// --- scroll matching ---------------------------------------------------------------------------
+// To tell how far the map has scrolled in the buffers, the new frame is compared with the previous
+// one at each candidate shift. The ground layer alone is blind to ramps and buildings (they live in
+// other layers) and ambiguous on plain terrain: a wrong guess shifted the whole picture by a tile,
+// invisible on flat ground but a visible jump of every ramp and building. So the building, ramp and
+// floor layers are compared too, against a copy of the previous frame kept here.
+constexpr size_t extra_layer_count=5;
+struct layer_snapshotst
+{
+	int32_t dim_x=0,dim_y=0;
+	std::array<std::vector<int32_t>,extra_layer_count> prev;
+	bool valid=false;
+};
+layer_snapshotst layer_snap;
+
+template<class E>
+int32_t flatten_cell(const E &value)
+{
+	if constexpr(std::is_arithmetic_v<E>||std::is_enum_v<E>)
+		return int32_t(value);
+	else
+		{
+		uint32_t v=0;
+		std::memcpy(&v,&value,std::min(sizeof(E),sizeof(v)));
+		return int32_t(v);
+		}
+}
+
+template<class T>
+void copy_layer(std::vector<int32_t> &out,const T *src,size_t n)
+{
+	if(src==nullptr){out.clear();return;}
+	out.resize(n);
+	for(size_t i=0;i<n;++i)out[i]=flatten_cell(src[i]);
+}
+
+int32_t extra_layer_value(const df::graphic_viewportst *vp,size_t layer,size_t index)
+{
+	switch(layer)
+		{
+		case 0:return vp->screentexpos_building_one!=nullptr?flatten_cell(vp->screentexpos_building_one[index]):0;
+		case 1:return vp->screentexpos_building_two!=nullptr?flatten_cell(vp->screentexpos_building_two[index]):0;
+		case 2:return vp->screentexpos_ramp_flag!=nullptr?flatten_cell(vp->screentexpos_ramp_flag[index]):0;
+		case 3:return vp->screentexpos_floor_flag!=nullptr?flatten_cell(vp->screentexpos_floor_flag[index]):0;
+		default:return vp->screentexpos_background_two!=nullptr?flatten_cell(vp->screentexpos_background_two[index]):0;
+		}
+}
+
+// Called once per frame after the scroll has been judged: keep this frame to compare the next with.
+void snapshot_layers(const df::graphic_viewportst *vp)
+{
+	layer_snap.valid=false;
+	if(vp==nullptr||vp->dim_x<=0||vp->dim_y<=0)return;
+	const size_t n=size_t(vp->dim_x)*size_t(vp->dim_y);
+	copy_layer(layer_snap.prev[0],vp->screentexpos_building_one,n);
+	copy_layer(layer_snap.prev[1],vp->screentexpos_building_two,n);
+	copy_layer(layer_snap.prev[2],vp->screentexpos_ramp_flag,n);
+	copy_layer(layer_snap.prev[3],vp->screentexpos_floor_flag,n);
+	copy_layer(layer_snap.prev[4],vp->screentexpos_background_two,n);
+	layer_snap.dim_x=vp->dim_x;
+	layer_snap.dim_y=vp->dim_y;
+	layer_snap.valid=true;
+}
+
 double background_match_ratio(const df::graphic_viewportst *vp,int32_t dwx,int32_t dwy)
 {
 	int32_t considered=0;
 	int32_t matches=0;
+	const bool extras=layer_snap.valid&&layer_snap.dim_x==vp->dim_x&&layer_snap.dim_y==vp->dim_y;
 	for(int32_t x=0;x<vp->dim_x;++x)
 		{
 		const int32_t sx=x+dwx;
@@ -345,10 +421,23 @@ double background_match_ratio(const df::graphic_viewportst *vp,int32_t dwx,int32
 			{
 			const int32_t sy=y+dwy;
 			if(sy<0||sy>=vp->dim_y)continue;
-			const int32_t cur=vp->screentexpos_background[x*vp->dim_y+y];
-			if(cur==0)continue;
-			++considered;
-			if(vp->screentexpos_background_old[sx*vp->dim_y+sy]==cur)++matches;
+			const size_t index=size_t(x)*size_t(vp->dim_y)+size_t(y);
+			const size_t sindex=size_t(sx)*size_t(vp->dim_y)+size_t(sy);
+			const int32_t cur=vp->screentexpos_background[index];
+			if(cur!=0)
+				{
+				++considered;
+				if(vp->screentexpos_background_old[sindex]==cur)++matches;
+				}
+			if(!extras)continue;
+			for(size_t k=0;k<extra_layer_count;++k)
+				{
+				if(layer_snap.prev[k].empty())continue;
+				const int32_t value=extra_layer_value(vp,k,index);
+				if(value==0)continue;
+				++considered;
+				if(layer_snap.prev[k][sindex]==value)++matches;
+				}
 			}
 		}
 	if(considered==0)return -1.0;
@@ -480,6 +569,12 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 		{line_follow.active=false;return false;}
 	const df::unit *adv=player_unit();
 	if(adv==nullptr){line_follow.active=false;return false;}
+	if(!centered_valid&&gps!=nullptr&&gps->main_viewport!=nullptr&&gps->main_viewport->dim_x>0)
+		{
+		centered_off_x=double(gps->main_viewport->dim_x/2);
+		centered_off_y=double(gps->main_viewport->dim_y/2);
+		centered_valid=true;
+		}
 	int32_t dest_x=adv->path.dest.x;
 	int32_t dest_y=adv->path.dest.y;
 	int32_t dest_z=adv->path.dest.z;
@@ -500,17 +595,48 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 	if(dest_x!=-30000)++dbg_dest_seen;
 	line_followst &lf=line_follow;
 	const bool linear=cam_ease==1||(cam_ease==0&&linear_ease_user);
+	const double dtd=double(dt);
 	if(!travelling&&lf.active)lf.finishing=true;
+	if(!travelling&&!lf.active&&centered_valid)
+		{
+		// standing still: learn where the view sits when it is centred (only ever by small steps,
+		// so a panned view can't be mistaken for the centred one)
+		const double ox=cwx-double(adv->pos.x);
+		const double oy=cwy-double(adv->pos.y);
+		if(std::abs(ox-centered_off_x)<=1.01&&std::abs(oy-centered_off_y)<=1.01&&
+			transient_x==0.0&&transient_y==0.0)
+			{
+			centered_idle_ms+=dtd;
+			if(centered_idle_ms>800.0){centered_off_x=ox;centered_off_y=oy;}
+			}
+		else centered_idle_ms=0.0;
+		}
 	if(lf.finishing)
 		{
-		// The walk is over. Don't hand the camera back to the quick decay (that snapped on the last
-		// step whenever the camera was still part-way): keep gliding at the same steady speed
-		// until it sits on the game's view, then let go.
+		// The walk is over. The game re-centres its view on the character shortly after (a jump of
+		// as many tiles as the camera was panned). The camera glides to where that centred view will
+		// be and waits there, so the picture is already in place when the jump arrives and nothing
+		// snaps. If no re-centre comes, it settles onto the view it has.
 		lf.dest_x=-30000;
-		const double fx=cwx-lf.cam_x;
-		const double fy=cwy-lf.cam_y;
+		lf.hold_ms+=dtd;
+		const bool settle=lf.hold_ms>1500.0;
+		const double gx=settle?cwx:lf.ex;
+		const double gy=settle?cwy:lf.ey;
+		const double fx=gx-lf.cam_x;
+		const double fy=gy-lf.cam_y;
 		const double dist=std::hypot(fx,fy);
-		if(dist<0.03)
+		if(dist>=0.03)
+			{
+			double v=std::max(3.0,lf.speed*2.0);
+			if(!linear)v=std::min(v,std::max(0.5,dist*3.0));
+			const double step=std::min(dist,v*dtd/1000.0);
+			lf.cam_x+=fx/dist*step;
+			lf.cam_y+=fy/dist*step;
+			}
+		transient_x=(cwx-lf.cam_x)*tile;
+		transient_y=(cwy-lf.cam_y)*tile;
+		++dbg_line_frames;
+		if(std::hypot(cwx-lf.cam_x,cwy-lf.cam_y)<0.03&&dist<0.03)
 			{
 			lf.active=false;
 			lf.finishing=false;
@@ -518,32 +644,27 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 			transient_y=0.0;
 			return false;
 			}
-		double v=std::max(3.0,lf.speed*2.0);
-		if(!linear)v=std::min(v,std::max(0.5,dist*3.0));
-		const double step=std::min(dist,v*double(dt)/1000.0);
-		lf.cam_x+=fx/dist*step;
-		lf.cam_y+=fy/dist*step;
-		transient_x=(cwx-lf.cam_x)*tile;
-		transient_y=(cwy-lf.cam_y)*tile;
-		++dbg_line_frames;
 		return true;
 		}
 	if(!travelling){line_follow.active=false;line_follow.dest_x=-30000;return false;}
 	if(!lf.active||dest_x!=lf.dest_x||dest_y!=lf.dest_y)
 		{
-		// start from wherever the camera is on screen right now, so nothing jumps
+		// start from wherever the camera is on screen right now (B), so nothing jumps
 		const double cx=lf.active?lf.cam_x:cwx-transient_x/tile;
 		const double cy=lf.active?lf.cam_y:cwy-transient_y/tile;
-		// Fix the destination ONCE. (Recomputing it every frame from the character and the game's
-		// view made the end of the line wobble by a tile whenever the two updated on different
-		// frames, which bent the path into an arc.)
-		lf.off_x=cx-double(adv->pos.x);
-		lf.off_y=cy-double(adv->pos.y);
-		lf.ex=double(dest_x)+lf.off_x;
-		lf.ey=double(dest_y)+lf.off_y;
+		// The camera travels from B to the destination (C): the view that is centred on C, which
+		// is C plus the centred offset. Fixed once, here. (Recomputing it every frame bent the
+		// path into an arc.) Any pan is therefore cancelled by the journey itself.
+		lf.ex=double(dest_x)+centered_off_x;
+		lf.ey=double(dest_y)+centered_off_y;
+		lf.pan_tiles=std::hypot(cx-(double(adv->pos.x)+centered_off_x),cy-(double(adv->pos.y)+centered_off_y));
+		lf.start_px=double(adv->pos.x);
+		lf.start_py=double(adv->pos.y);
+		lf.d0=std::max(1.0,std::hypot(double(dest_x)-lf.start_px,double(dest_y)-lf.start_py));
 		++dbg_line_starts;
 		lf.active=true;
 		lf.finishing=false;
+		lf.hold_ms=0.0;
 		lf.dest_x=dest_x;
 		lf.dest_y=dest_y;
 		lf.sx=cx;
@@ -555,7 +676,11 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 		lf.ref_u=0.0;
 		lf.ref_ms=0.0;
 		lf.elapsed_ms=0.0;
-		lf.speed=1000.0/double(std::max<uint32_t>(cam_speed_ms>0?cam_speed_ms:effective_step_ms,1));
+		const double step_ms=double(std::max<uint32_t>(cam_speed_ms>0?cam_speed_ms:effective_step_ms,1));
+		lf.speed=1000.0/step_ms;
+		// A short walk is one smooth journey that takes about as long as the walk itself.
+		const double steps=std::max(std::abs(double(dest_x)-lf.start_px),std::abs(double(dest_y)-lf.start_py));
+		lf.tween_ms=std::max(350.0,steps*step_ms*0.9);
 		}
 	const double vx=lf.ex-lf.sx;
 	const double vy=lf.ey-lf.sy;
@@ -563,49 +688,58 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 	if(len<0.75){lf.finishing=true;return false;}   // practically there: finish gliding next frame
 	++dbg_line_frames;
 	const double dx=vx/len,dy=vy/len;
-	const double dtd=double(dt);
 	lf.elapsed_ms+=dtd;
-	// where the character's own steps have got to along the line
-	const double ut=std::clamp((cwx-lf.sx)*dx+(cwy-lf.sy)*dy,0.0,len);
-	// walking speed along the line, measured over ~0.4s windows (unless the speed is fixed)
-	lf.ref_ms+=dtd;
-	if(lf.ref_ms>=400.0)
+	// how far along the walk the character is (a fraction, so a pan doesn't confuse it), as a
+	// distance along the camera's line
+	const double left=std::hypot(double(dest_x)-double(adv->pos.x),double(dest_y)-double(adv->pos.y));
+	const double frac=std::clamp(1.0-left/lf.d0,0.0,1.0);
+	const double ut=frac*len;
+	if(len<=line_lead_tiles+2.0)
 		{
-		const double v=(ut-lf.ref_u)*1000.0/lf.ref_ms;
-		if(cam_speed_ms==0&&v>0.3)lf.speed=std::clamp(0.5*lf.speed+0.5*v,0.5,40.0);
-		lf.ref_u=ut;
-		lf.ref_ms=0.0;
+		// short walk: ease along the whole line over the walk's own duration
+		const double t=std::clamp(lf.elapsed_ms/lf.tween_ms,0.0,1.0);
+		lf.u=len*(linear?t:smooth01(t));
 		}
-	// the character's progress, smoothed so its tile steps don't show: it advances at the walking
-	// speed and is only gently pulled toward the real position
-	lf.cu+=lf.speed*dtd/1000.0;
-	lf.cu+=(ut-lf.cu)*(1.0-std::exp(-dtd/300.0));
-	// never more than a tile from where the character really is: otherwise the camera runs so far
-	// ahead that the safety limit below ties it to the game's tile-stepped view (a visible stutter)
-	lf.cu=std::clamp(lf.cu,std::max(0.0,ut-1.0),std::min(len,ut+1.0));
-	// The camera moves on its own: off toward a point up to `lead` tiles ahead of the character
-	// (or the destination), at a steady speed faster than walking, then waits there for the
-	// character to catch up.
-	const double goal=std::min(len,lf.cu+line_lead_tiles);
-	const double remain=goal-lf.u;
-	double move=0.0;
-	if(remain>0.0)
+	else
 		{
-		double v=std::max(3.0,lf.speed*2.0);   // tiles per second
-		if(!linear)
+		// walking speed along the line, measured over ~0.4s windows (unless the speed is fixed)
+		lf.ref_ms+=dtd;
+		if(lf.ref_ms>=400.0)
 			{
-			const uint32_t cam_ms=cam_speed_ms>0?cam_speed_ms:effective_step_ms;
-			v*=std::max(0.15,smooth01(lf.elapsed_ms/(3.0*double(cam_ms))));   // ease in
-			v=std::min(v,std::max(0.5,remain*3.0));                          // ease out
+			const double v=(ut-lf.ref_u)*1000.0/lf.ref_ms;
+			if(cam_speed_ms==0&&v>0.3)lf.speed=std::clamp(0.5*lf.speed+0.5*v,0.5,40.0);
+			lf.ref_u=ut;
+			lf.ref_ms=0.0;
 			}
-		move=std::min(remain,v*dtd/1000.0);
+		// the character's progress, smoothed so its tile steps don't show
+		lf.cu+=lf.speed*dtd/1000.0;
+		lf.cu+=(ut-lf.cu)*(1.0-std::exp(-dtd/300.0));
+		// never more than a tile from where the character really is: otherwise the camera runs so
+		// far ahead that the safety limit below ties it to the game's tile-stepped view
+		lf.cu=std::clamp(lf.cu,std::max(0.0,ut-1.0),std::min(len,ut+1.0));
+		// The camera moves on its own: off toward a point up to `lead` tiles ahead of the
+		// character (or the destination), at a steady speed faster than walking, then waits there.
+		const double goal=std::min(len,lf.cu+line_lead_tiles);
+		const double remain=goal-lf.u;
+		double move=0.0;
+		if(remain>0.0)
+			{
+			double v=std::max(3.0,lf.speed*2.0);   // tiles per second
+			if(!linear)
+				{
+				const uint32_t cam_ms=cam_speed_ms>0?cam_speed_ms:effective_step_ms;
+				v*=std::max(0.15,smooth01(lf.elapsed_ms/(3.0*double(cam_ms))));   // ease in
+				v=std::min(v,std::max(0.5,remain*3.0));                          // ease out
+				}
+			move=std::min(remain,v*dtd/1000.0);
+			}
+		lf.u=std::clamp(lf.u+move,0.0,len);
 		}
-	lf.u=std::clamp(lf.u+move,0.0,len);
 	lf.cam_x=lf.sx+dx*lf.u;
 	lf.cam_y=lf.sy+dy*lf.u;
 	double tx=(cwx-lf.cam_x)*tile;
 	double ty=(cwy-lf.cam_y)*tile;
-	const double lim=(line_lead_tiles+4.0)*tile;
+	const double lim=(line_lead_tiles+4.0+lf.pan_tiles)*tile;
 	const double mag=std::hypot(tx,ty);
 	if(mag>lim)
 		{
@@ -1795,6 +1929,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	if(!viewport_readable(vp)||renderer->sdl_renderer==nullptr)
 		return;
 	update_camera(renderer,vp,animation_manager.get_frame_delta_ms());
+	snapshot_layers(vp);
 	trace_frame(now_ms,window_x?*window_x:0,window_y?*window_y:0);
 	const double cam_tile=tile_px(renderer);
 	const int32_t glide_x=int32_t(std::lround(transient_x+rest_x*cam_tile));
@@ -1966,6 +2101,8 @@ void reset_state()
 	cam_ease=0;
 	line_camera=true;
 	line_follow=line_followst{};
+	centered_valid=false;
+	centered_idle_ms=0.0;
 	line_lead_tiles=6.0;
 	sdl_mouse_scale=1.0;
 	mouse_fix=true;
