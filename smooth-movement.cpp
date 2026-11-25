@@ -44,7 +44,7 @@ REQUIRE_GLOBAL(window_z);
 
 namespace {
 
-constexpr const char *plugin_version="0.4.2-adv";
+constexpr const char *plugin_version="0.5.1-adv";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -74,7 +74,15 @@ bool flip_enabled=false;
 // camera glide the player stands still on screen while the whole map snaps. So in adventure mode
 // (when `adventure on`, the default) the free camera glide is switched on and steps ease linearly.
 // Leaving adventure mode restores what was set before. Fortress mode is untouched.
-uint32_t step_duration_ms=100;       // `smooth-movement-adv speed <ms>`
+uint32_t step_duration_ms=100;       // `smooth-movement-adv speed <ms>` (the shortest a step may take)
+bool adaptive_speed=true;            // `smooth-movement-adv adaptive on|off`
+uint32_t cam_speed_ms=0;             // `smooth-movement-adv camera speed <ms>|auto` (0 = follow steps)
+int32_t cam_ease=0;                  // `smooth-movement-adv camera ease linear|smooth|auto` (0 auto, 1 linear, 2 smooth)
+// The step length actually in use. With adaptive speed it follows how often steps really arrive,
+// so a run keeps the camera moving at one steady speed instead of glide, pause, glide.
+uint32_t effective_step_ms=100;
+double step_interval_ema=0.0;
+uint32_t last_land_ms=0;
 bool linear_ease_user=false;         // `smooth-movement-adv ease linear|smooth`
 bool adventure_preset=true;          // `smooth-movement-adv adventure on|off`
 bool preset_active=false;
@@ -90,10 +98,45 @@ uint32_t dbg_cam_overflow=0;     // scrolled too far to follow, snapped
 uint32_t dbg_cam_jumps=0;        // teleport-like jumps, snapped
 uint32_t dbg_cam_drag_frames=0;  // frames spent middle-mouse dragging
 
+void apply_animation_settings();
+
+// A step just landed: measure the time since the previous one and stretch the step length to it.
+// Both the camera glide and the sprite slide use effective_step_ms, so they stay in time.
+void note_step(uint32_t now_ms)
+	{
+	if(!adaptive_speed)return;
+	if(last_land_ms!=0)
+		{
+		const uint32_t gap=now_ms-last_land_ms;
+		if(gap>=30&&gap<=700)
+			{
+			step_interval_ema=step_interval_ema==0.0?
+			double(gap):0.6*step_interval_ema+0.4*double(gap);
+			const double wanted=std::clamp(step_interval_ema,double(step_duration_ms),500.0);
+			// small changes are ignored so a step already under way does not jump
+			if(std::abs(wanted-double(effective_step_ms))>0.08*double(effective_step_ms))
+				{
+				effective_step_ms=uint32_t(wanted);
+				apply_animation_settings();
+				}
+			}
+		else if(gap>700)
+			{
+			step_interval_ema=0.0;
+			if(effective_step_ms!=step_duration_ms)
+				{
+				effective_step_ms=step_duration_ms;
+				apply_animation_settings();
+				}
+			}
+		}
+	last_land_ms=now_ms;
+	}
+
 void apply_animation_settings()
 
 {
-	animation_manager.set_movement_duration_ms(step_duration_ms);
+	animation_manager.set_movement_duration_ms(effective_step_ms);
 	animation_manager.set_linear_easing(linear_ease_user||preset_active);
 }
 
@@ -418,6 +461,7 @@ void update_camera(
 			else if(best_mag>0)
 				{
 				attribute_landed(best_ax,best_ay,tile);
+				if(!drag_active&&(best_ax!=0||best_ay!=0))note_step(animation_manager.get_frame_time_ms());
 				++dbg_cam_landed;
 				camera_pending_dx-=best_ax;
 				camera_pending_dy-=best_ay;
@@ -489,20 +533,25 @@ void update_camera(
 
 	if(transient_x!=0.0||transient_y!=0.0)
 		{
-		if(preset_active||linear_ease_user)
+		const uint32_t cam_ms=cam_speed_ms>0?cam_speed_ms:effective_step_ms;
+		const bool cam_linear=cam_ease==1||(cam_ease==0&&(preset_active||linear_ease_user));
+		if(cam_linear)
 		{
 		// Constant-speed catch-up at one tile per step duration, so the world scrolls at the same
 		// pace the character walks and the character stays put on screen. (An exponential
 		// decay starts fast and slows down, which reads as a jerk on every step.)
 		const double mag=std::hypot(transient_x,transient_y);
-		const double step=tile*double(delta_ms)/double(std::max<uint32_t>(step_duration_ms,1));
+		// A little extra speed when steps have piled up, so the camera never falls far behind.
+		const double debt=std::max(1.0,mag/tile);
+		const double step=debt*tile*double(delta_ms)/double(std::max<uint32_t>(cam_ms,1));
 		const double scale=mag<=step?0.0:(mag-step)/mag;
 		transient_x*=scale;
 		transient_y*=scale;
 		}
 		else
 		{
-		const double k=std::exp(-double(delta_ms)/camera_tau_ms);
+		// eases out: fast at first, slowing as it arrives; slower settings stretch it
+		const double k=std::exp(-double(delta_ms)/(camera_tau_ms*double(cam_ms)/100.0));
 		transient_x*=k;
 		transient_y*=k;
 		}
@@ -1592,6 +1641,12 @@ void reset_state()
 	camera_was_offset=false;
 	flip_enabled=false;
 	step_duration_ms=100;
+	cam_speed_ms=0;
+	cam_ease=0;
+	effective_step_ms=100;
+	step_interval_ema=0.0;
+	last_land_ms=0;
+	adaptive_speed=true;
 	linear_ease_user=false;
 	adventure_preset=true;
 	preset_active=false;
@@ -1599,10 +1654,35 @@ void reset_state()
 	apply_animation_settings();
 }
 
-command_result status_command(
-	color_ostream &out,
-	std::vector<std::string> &parameters)
+void print_help(color_ostream &out)
 {
+out.print(
+"smooth-movement-adv commands (all are 'smooth-movement-adv <command>'):\n"
+"  help                          this list\n"
+"  (nothing)                     show the current status\n"
+"  debug [reset]                 self-check numbers: settings in effect, step and camera counters\n"
+"  speed <20-500>                shortest time a tile step takes, in ms (default 100)\n"
+"  ease linear|smooth            easing of the step animation (adventure mode forces linear)\n"
+"  adaptive on|off               stretch steps to how often they really arrive (default on)\n"
+"  adventure on|off              adventure mode tuning: linear steps and the free camera (default on)\n"
+"  camera on|off|reset           free camera: on, off, or clear its sub-tile offset\n"
+"  camera <fx> <fy>              park the camera at an offset in tiles (-0.99..0.99)\n"
+"  camera speed <20-1000>|auto   camera glide time per tile in ms; auto follows the step speed\n"
+"  camera ease linear|smooth|auto   camera glide easing; auto follows the step easing\n"
+"  flip on|off                   flip creature sprites toward their direction of travel\n"
+"Settings reset to their defaults whenever the plugin is enabled.\n");
+}
+
+command_result status_command_run(
+color_ostream &out,
+std::vector<std::string> &parameters)
+{
+if(!parameters.empty()&&
+(parameters[0]=="help"||parameters[0]=="?"||parameters[0]=="--help"||parameters[0]=="-h"))
+{
+print_help(out);
+return CR_OK;
+}
 	if(parameters.empty())
 		{
 		out.print(
@@ -1616,10 +1696,14 @@ command_result status_command(
 		out.print("step duration: {} ms, easing: {}\n",
 			step_duration_ms,(linear_ease_user||preset_active)?"linear":"smooth");
 		out.print("adventure mode tuning: {}{}\n",
-			adventure_preset?"on":"off",preset_active?" (active now)":"");
+		adventure_preset?"on":"off",preset_active?" (active now)":"");
+		out.print("camera speed: {} | camera easing: {}\n",
+		cam_speed_ms==0?std::string("auto"):std::to_string(cam_speed_ms)+" ms",
+		cam_ease==1?"linear":cam_ease==2?"smooth":"auto");
+		out.print("type 'smooth-movement-adv help' for every command\n");
 		return CR_OK;
 		}
-	if(parameters[0]=="debug")
+		if(parameters[0]=="debug")
 		{
 		if(parameters.size()==2&&parameters[1]=="reset")
 			{
@@ -1636,6 +1720,11 @@ command_result status_command(
 			plugin_version,is_enabled?"yes":"no",World::isAdventureMode()?"yes":"no");
 		out.print("setting: speed {} ms, user-linear {}, adventure tuning {}\n",
 			step_duration_ms,linear_ease_user?"yes":"no",adventure_preset?"on":"off");
+		out.print("camera speed setting: {} | camera easing setting: {}\n",
+		cam_speed_ms==0?std::string("auto"):std::to_string(cam_speed_ms)+" ms",
+		cam_ease==1?"linear":cam_ease==2?"smooth":"auto");
+		out.print("adaptive speed: {} | measured step interval {:.0f} ms | step in use {} ms\n",
+		adaptive_speed?"on":"off",step_interval_ema,effective_step_ms);
 		out.print("in effect: preset active {} | manager duration {} ms | easing {}\n",
 			preset_active?"YES":"no",animation_manager.get_movement_duration_ms(),
 			animation_manager.get_linear_easing()?"linear":"smooth");
@@ -1671,6 +1760,8 @@ command_result status_command(
 					return CR_FAILURE;
 					}
 				step_duration_ms=uint32_t(value);
+				effective_step_ms=step_duration_ms;
+				step_interval_ema=0.0;
 				apply_animation_settings();
 				out.print("smooth-movement-adv: step duration {} ms\n",step_duration_ms);
 				return CR_OK;
@@ -1679,6 +1770,25 @@ command_result status_command(
 				{
 				return CR_WRONG_USAGE;
 				}
+			}
+		return CR_WRONG_USAGE;
+		}
+	if(parameters[0]=="adaptive")
+		{
+		if(parameters.size()==1)
+			{
+			out.print("adaptive speed: {} (step now {} ms)\n",adaptive_speed?"on":"off",effective_step_ms);
+			return CR_OK;
+			}
+		if(parameters.size()==2&&(parameters[1]=="on"||parameters[1]=="off"))
+			{
+			adaptive_speed=parameters[1]=="on";
+			effective_step_ms=step_duration_ms;
+			step_interval_ema=0.0;
+			last_land_ms=0;
+			apply_animation_settings();
+			out.print("smooth-movement-adv: adaptive speed {}\n",adaptive_speed?"on":"off");
+			return CR_OK;
 			}
 		return CR_WRONG_USAGE;
 		}
@@ -1718,9 +1828,59 @@ command_result status_command(
 		return CR_WRONG_USAGE;
 		}
 	if(parameters[0]=="camera")
-		{
-		if(parameters.size()==1)
-			{
+	{
+	if(parameters.size()>=2&&parameters[1]=="speed")
+	{
+	if(parameters.size()==2)
+	{
+	out.print("camera speed: {}\n",cam_speed_ms==0?std::string("auto (follows the step speed)"):
+	std::to_string(cam_speed_ms)+" ms per tile");
+	return CR_OK;
+	}
+	if(parameters.size()==3&&parameters[2]=="auto")
+	{
+	cam_speed_ms=0;
+	out.print("smooth-movement-adv: camera speed auto\n");
+	return CR_OK;
+	}
+	if(parameters.size()==3)
+	{
+	try
+	{
+	const long value=std::stol(parameters[2]);
+	if(value<20||value>1000)
+	{
+	out.printerr("camera speed must be 20..1000 (milliseconds per tile) or auto\n");
+	return CR_FAILURE;
+	}
+	cam_speed_ms=uint32_t(value);
+	out.print("smooth-movement-adv: camera speed {} ms per tile\n",cam_speed_ms);
+	return CR_OK;
+	}
+	catch(...)
+	{
+	return CR_WRONG_USAGE;
+	}
+	}
+	return CR_WRONG_USAGE;
+	}
+	if(parameters.size()>=2&&parameters[1]=="ease")
+	{
+	if(parameters.size()==2)
+	{
+	out.print("camera easing: {}\n",cam_ease==1?"linear":cam_ease==2?"smooth":"auto (follows the step easing)");
+	return CR_OK;
+	}
+	if(parameters.size()==3&&(parameters[2]=="linear"||parameters[2]=="smooth"||parameters[2]=="auto"))
+	{
+	cam_ease=parameters[2]=="linear"?1:parameters[2]=="smooth"?2:0;
+	out.print("smooth-movement-adv: camera easing {}\n",parameters[2]);
+	return CR_OK;
+	}
+	return CR_WRONG_USAGE;
+	}
+	if(parameters.size()==1)
+	{
 			out.print("free camera: {}, offset {:.3f} {:.3f}\n",
 				camera_enabled?"on":"off",-rest_x,-rest_y);
 			return CR_OK;
@@ -1797,6 +1957,20 @@ command_result status_command(
 	return CR_WRONG_USAGE;
 }
 
+// A command DFHack cannot show help for would only print "No help entry", so show ours instead.
+command_result status_command(
+color_ostream &out,
+std::vector<std::string> &parameters)
+{
+const command_result result=status_command_run(out,parameters);
+if(result==CR_WRONG_USAGE)
+{
+print_help(out);
+return CR_FAILURE;
+}
+return result;
+}
+
 } // namespace
 
 DFhackCExport command_result
@@ -1806,7 +1980,7 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 		"smooth-movement-adv",
 		"Smooth movement status; free camera: camera on|off|reset|<fx> <fy>; "
 		"sprite flipping: flip on|off; step duration: speed <ms>; "
-		"easing: ease linear|smooth; adventure mode tuning: adventure on|off; self-check: debug [reset].",
+		"easing: ease linear|smooth; adventure mode tuning: adventure on|off; camera speed and easing: camera speed <ms>|auto, camera ease linear|smooth|auto; self-check: debug [reset]; full list: help.",
 		status_command);
 	return CR_OK;
 }
