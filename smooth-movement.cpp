@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstdint>
 #include <set>
+#include <cstdlib>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -48,7 +49,7 @@ REQUIRE_GLOBAL(world);
 
 namespace {
 
-constexpr const char *plugin_version="0.7.0-adv";
+constexpr const char *plugin_version="0.8.0-adv";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -183,6 +184,7 @@ struct line_followst
 	double ex=0.0,ey=0.0;                    // destination, in window coordinates
 	double cam_x=0.0,cam_y=0.0;              // the camera's own continuous position
 	double u=0.0;                            // camera distance along the line, tiles
+	double cu=0.0;                           // smoothed character progress along the line, tiles
 	double speed=7.0;                        // camera speed along the line, tiles per second
 	double ref_u=0.0;                        // for measuring the walking speed
 	double ref_ms=0.0;
@@ -190,7 +192,7 @@ struct line_followst
 	int32_t dest_x=-30000,dest_y=-30000;
 };
 line_followst line_follow;
-constexpr double line_max_drift_tiles=1.5;   // the character may drift this far from screen centre
+double line_lead_tiles=6.0;                  // `camera lead <tiles>`: how far ahead of the character the camera may wait
 
 double tile_px(const df::renderer_2d_base *renderer)
 {
@@ -387,7 +389,8 @@ void attribute_landed(int32_t ax,int32_t ay,double tile)
 // While the character walks to a click-to-move destination, the camera moves on its own: a
 // continuous position travels along the straight line from where it started to the destination at
 // the walking speed, and the world is drawn offset by (game view - camera). The character's tile
-// steps only nudge the speed estimate, so the camera never follows the stepped path.
+// steps only nudge the speed estimate, so the camera never follows the stepped path. It runs ahead
+// of the character (up to `camera lead` tiles) and waits for it to catch up.
 // Returns false when not travelling (the ordinary glide takes over).
 double smooth01(double t)
 {
@@ -422,6 +425,7 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 		lf.cam_x=cx;
 		lf.cam_y=cy;
 		lf.u=0.0;
+		lf.cu=0.0;
 		lf.ref_u=0.0;
 		lf.ref_ms=0.0;
 		lf.elapsed_ms=0.0;
@@ -446,22 +450,34 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 		lf.ref_ms=0.0;
 		}
 	const bool linear=cam_ease==1||(cam_ease==0&&linear_ease_user);
-	double factor=1.0;
-	if(!linear)
+	// the character's progress, smoothed so its tile steps don't show: it advances at the walking
+	// speed and is only gently pulled toward the real position
+	lf.cu+=lf.speed*dtd/1000.0;
+	lf.cu+=(ut-lf.cu)*(1.0-std::exp(-dtd/300.0));
+	lf.cu=std::clamp(lf.cu,0.0,len);
+	// The camera moves on its own: off toward a point up to `lead` tiles ahead of the character
+	// (or the destination), at a steady speed faster than walking, then waits there for the
+	// character to catch up.
+	const double goal=std::min(len,lf.cu+line_lead_tiles);
+	const double remain=goal-lf.u;
+	double move=0.0;
+	if(remain>0.0)
 		{
-		const uint32_t cam_ms=cam_speed_ms>0?cam_speed_ms:effective_step_ms;
-		factor=std::max(0.2,smooth01(lf.elapsed_ms/(3.0*double(cam_ms))))*
-			std::max(0.15,smooth01((len-lf.u)/2.0));
+		double v=std::max(3.0,lf.speed*2.0);   // tiles per second
+		if(!linear)
+			{
+			const uint32_t cam_ms=cam_speed_ms>0?cam_speed_ms:effective_step_ms;
+			v*=std::max(0.15,smooth01(lf.elapsed_ms/(3.0*double(cam_ms))));   // ease in
+			v=std::min(v,std::max(0.5,remain*3.0));                          // ease out
+			}
+		move=std::min(remain,v*dtd/1000.0);
 		}
-	// a gentle pull toward the character keeps the camera honest about speed changes
-	lf.u+=(ut-lf.u)*(1.0-std::exp(-dtd/800.0));
-	lf.u+=lf.speed*factor*dtd/1000.0;
-	lf.u=std::clamp(lf.u,0.0,len);
+	lf.u=std::clamp(lf.u+move,0.0,len);
 	lf.cam_x=lf.sx+dx*lf.u;
 	lf.cam_y=lf.sy+dy*lf.u;
 	double tx=(cwx-lf.cam_x)*tile;
 	double ty=(cwy-lf.cam_y)*tile;
-	const double lim=line_max_drift_tiles*tile;
+	const double lim=(line_lead_tiles+2.0)*tile;
 	const double mag=std::hypot(tx,ty);
 	if(mag>lim)
 		{
@@ -1742,6 +1758,7 @@ void reset_state()
 	cam_ease=0;
 	line_camera=true;
 	line_follow=line_followst{};
+	line_lead_tiles=6.0;
 	effective_step_ms=100;
 	step_interval_ema=0.0;
 	last_land_ms=0;
@@ -1765,6 +1782,7 @@ out.print(
 "  camera on|off|reset           free camera: on (default), off, or clear its sub-tile offset\n"
 "  camera <fx> <fy>              park the camera at an offset in tiles (-0.99..0.99)\n"
 "  camera line on|off            glide in a straight line to a click-to-move destination (default on)\n"
+"  camera lead <tiles>           how far ahead of the character the camera may run and wait (default 6)\n"
 "  camera speed <20-1000>|auto   camera glide time per tile in ms; auto follows the step speed\n"
 "  camera ease linear|smooth|auto   camera glide easing; auto follows the step easing (default smooth)\n"
 "  flip on|off                   flip creature sprites toward their direction of travel\n"
@@ -1925,6 +1943,24 @@ return CR_OK;
 	}
 	return CR_WRONG_USAGE;
 	}
+	if(parameters.size()>=2&&parameters[1]=="lead")
+	{
+	if(parameters.size()==2)
+	{
+	out.print("camera lead: {:.1f} tiles\n",line_lead_tiles);
+	return CR_OK;
+	}
+	if(parameters.size()==3)
+	{
+	char *end=nullptr;
+	const double v=std::strtod(parameters[2].c_str(),&end);
+	if(end==parameters[2].c_str()||*end!='\0'||v<0.0||v>40.0)return CR_WRONG_USAGE;
+	line_lead_tiles=v;
+	out.print("smooth-movement-adv: camera lead {:.1f} tiles\n",v);
+	return CR_OK;
+	}
+	return CR_WRONG_USAGE;
+	}
 	if(parameters.size()>=2&&parameters[1]=="speed")
 	{
 	if(parameters.size()==2)
@@ -2076,7 +2112,7 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 		"smooth-movement-adv",
 		"Smooth movement status; free camera: camera on|off|reset|<fx> <fy>; "
 		"sprite flipping: flip on|off; step duration: speed <ms>; "
-		"easing: ease linear|smooth; straight-line camera: camera line on|off; camera speed and easing: camera speed <ms>|auto, camera ease linear|smooth|auto; self-check: debug [reset]; full list: help.",
+		"easing: ease linear|smooth; straight-line camera: camera line on|off, camera lead <tiles>; camera speed and easing: camera speed <ms>|auto, camera ease linear|smooth|auto; self-check: debug [reset]; full list: help.",
 		status_command);
 	return CR_OK;
 }
