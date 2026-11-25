@@ -52,7 +52,7 @@ REQUIRE_GLOBAL(world);
 
 namespace {
 
-constexpr const char *plugin_version="0.11.0-adv";
+constexpr const char *plugin_version="0.11.1-adv";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -211,6 +211,7 @@ line_followst line_follow;
 // character, in tiles). Starts as half the map view and is refined while standing still.
 double centered_off_x=0.0,centered_off_y=0.0;
 bool centered_valid=false;
+bool centered_learned=false;
 double centered_idle_ms=0.0;
 double line_lead_tiles=6.0;                  // `camera lead <tiles>`: how far ahead of the character the camera may wait
 
@@ -571,8 +572,9 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 	if(adv==nullptr){line_follow.active=false;return false;}
 	if(!centered_valid&&gps!=nullptr&&gps->main_viewport!=nullptr&&gps->main_viewport->dim_x>0)
 		{
-		centered_off_x=double(gps->main_viewport->dim_x/2);
-		centered_off_y=double(gps->main_viewport->dim_y/2);
+		// the window's corner sits half a view up and to the left of the character
+		centered_off_x=-double(gps->main_viewport->dim_x/2);
+		centered_off_y=-double(gps->main_viewport->dim_y/2);
 		centered_valid=true;
 		}
 	int32_t dest_x=adv->path.dest.x;
@@ -603,11 +605,18 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 		// so a panned view can't be mistaken for the centred one)
 		const double ox=cwx-double(adv->pos.x);
 		const double oy=cwy-double(adv->pos.y);
-		if(std::abs(ox-centered_off_x)<=1.01&&std::abs(oy-centered_off_y)<=1.01&&
+		// (the first time, accept anything near the estimate: it is only a guess from the view size)
+		const double tol=centered_learned?1.01:6.0;
+		if(std::abs(ox-centered_off_x)<=tol&&std::abs(oy-centered_off_y)<=tol&&
 			transient_x==0.0&&transient_y==0.0)
 			{
 			centered_idle_ms+=dtd;
-			if(centered_idle_ms>800.0){centered_off_x=ox;centered_off_y=oy;}
+			if(centered_idle_ms>800.0)
+				{
+				centered_off_x=ox;
+				centered_off_y=oy;
+				centered_learned=true;
+				}
 			}
 		else centered_idle_ms=0.0;
 		}
@@ -2102,6 +2111,7 @@ void reset_state()
 	line_camera=true;
 	line_follow=line_followst{};
 	centered_valid=false;
+	centered_learned=false;
 	centered_idle_ms=0.0;
 	line_lead_tiles=6.0;
 	sdl_mouse_scale=1.0;
@@ -2225,7 +2235,8 @@ return CR_OK;
 		out.print("mouse via SDL events: hook {} | events {} | shifted {} | last shift {} {} px | scale {:.2f}\n",
 			sdl_mouse_seen?"called":"NOT called (using field edits)",dbg_sdl_events,dbg_sdl_shifted,
 			dbg_sdl_dx,dbg_sdl_dy,sdl_mouse_scale);
-		out.print("camera offset now: {} {} px\n",last_glide_x,last_glide_y);
+		out.print("camera offset now: {} {} px | centred view offset {:.0f} {:.0f} ({})\n",
+			last_glide_x,last_glide_y,centered_off_x,centered_off_y,centered_learned?"learned":"estimated");
 		out.print("mouse compensation: tile shift {} {} (0 0 when the view is not offset)\n",
 			dbg_mouse_dx,dbg_mouse_dy);
 		out.print("camera: scrolls {} | landed {} (big re-centres {}) | waits {} | drag frames {}\n",
