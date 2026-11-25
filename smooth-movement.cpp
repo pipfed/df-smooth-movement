@@ -44,7 +44,7 @@ REQUIRE_GLOBAL(window_z);
 
 namespace {
 
-constexpr const char *plugin_version="0.4.0-adv";
+constexpr const char *plugin_version="0.4.2-adv";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -136,6 +136,86 @@ double tile_px(const df::renderer_2d_base *renderer)
 {
 	const int32_t zoom=renderer->viewport_zoom_factor;
 	return double(zoom==128?32:std::max(1,zoom*32/128));
+}
+
+// --- mouse compensation ------------------------------------------------------------------------
+// The world is drawn offset by the camera (sub-tile rest offset plus the glide), but the game still
+// works out which tile the mouse is over as if nothing were offset. Over the map we hand the game
+// the mouse position it WOULD see if the picture were unshifted. WORKAROUND: this edits the game's
+// mouse position fields (gps->mouse_x/y and precise_mouse_x/y) every frame instead of using a
+// game feature; the original values are remembered so they can be recovered.
+struct mouse_compst
+{
+	bool has=false;
+	int32_t raw_px=0,raw_py=0,raw_tx=0,raw_ty=0;
+	int32_t out_px=0,out_py=0,out_tx=0,out_ty=0;
+};
+mouse_compst mouse_comp;
+int32_t dbg_mouse_dx=0;   // last tile shift applied to the mouse, for `debug`
+int32_t dbg_mouse_dy=0;
+
+// The game's mouse values with our own compensation taken back out.
+void raw_mouse(int32_t &px,int32_t &py,int32_t &tx,int32_t &ty)
+{
+	px=gps->precise_mouse_x;
+	py=gps->precise_mouse_y;
+	tx=gps->mouse_x;
+	ty=gps->mouse_y;
+	if(mouse_comp.has&&px==mouse_comp.out_px&&py==mouse_comp.out_py&&
+		tx==mouse_comp.out_tx&&ty==mouse_comp.out_ty)
+		{
+		px=mouse_comp.raw_px;
+		py=mouse_comp.raw_py;
+		tx=mouse_comp.raw_tx;
+		ty=mouse_comp.raw_ty;
+		}
+}
+
+void compensate_mouse(
+	const df::renderer_2d_base *renderer,
+	const df::graphic_viewportst *vp,
+	int32_t offset_x,
+	int32_t offset_y,
+	bool suspend)
+{
+	if(gps==nullptr)return;
+	int32_t px=0,py=0,tx=0,ty=0;
+	raw_mouse(px,py,tx,ty);
+	int32_t opx=px,opy=py,otx=tx,oty=ty;
+	const bool over_map=vp!=nullptr&&
+		tx>=vp->clipx[0]&&tx<=vp->clipx[1]&&ty>=vp->clipy[0]&&ty<=vp->clipy[1];
+	if(!suspend&&over_map&&(offset_x!=0||offset_y!=0))
+		{
+		const double tile=tile_px(renderer);
+		const double ox=double(renderer->origin_x);
+		const double oy=double(renderer->origin_y);
+		opx=px-offset_x;
+		opy=py-offset_y;
+		otx=tx+int32_t(std::floor((double(opx)-ox)/tile)-std::floor((double(px)-ox)/tile));
+		oty=ty+int32_t(std::floor((double(opy)-oy)/tile)-std::floor((double(py)-oy)/tile));
+		}
+	mouse_comp={true,px,py,tx,ty,opx,opy,otx,oty};
+	gps->precise_mouse_x=opx;
+	gps->precise_mouse_y=opy;
+	gps->mouse_x=otx;
+	gps->mouse_y=oty;
+	dbg_mouse_dx=otx-tx;
+	dbg_mouse_dy=oty-ty;
+}
+
+// Gives the game its own values back (plugin disabled).
+void restore_mouse()
+{
+	if(gps==nullptr||!mouse_comp.has)return;
+	int32_t px=0,py=0,tx=0,ty=0;
+	raw_mouse(px,py,tx,ty);
+	gps->precise_mouse_x=px;
+	gps->precise_mouse_y=py;
+	gps->mouse_x=tx;
+	gps->mouse_y=ty;
+	mouse_comp=mouse_compst{};
+	dbg_mouse_dx=0;
+	dbg_mouse_dy=0;
 }
 
 // Match ratio of "buffers shifted by (dwx,dwy)" on the background layer: 0..1, or -1 when there
@@ -364,6 +444,9 @@ void update_camera(
 	// Positions are tracked against the CONTENT window (window minus unlanded jumps) so the
 	// buffer lag never causes a visible stutter.
 	const bool mbut=enabler!=nullptr&&enabler->mouse_mbut;
+	// The drag works on the mouse as the player moved it, not as compensated for the camera.
+	int32_t mouse_px=0,mouse_py=0,mouse_tx=0,mouse_ty=0;
+	if(gps!=nullptr)raw_mouse(mouse_px,mouse_py,mouse_tx,mouse_ty);
 	const double content_wx=double(wx-camera_pending_dx);
 	const double content_wy=double(wy-camera_pending_dy);
 	if(mbut&&!drag_active&&gps!=nullptr)
@@ -371,8 +454,8 @@ void update_camera(
 		drag_active=true;
 		drag_anchor_vx=content_wx-rest_x-transient_x/tile;
 		drag_anchor_vy=content_wy-rest_y-transient_y/tile;
-		drag_anchor_mx=gps->precise_mouse_x;
-		drag_anchor_my=gps->precise_mouse_y;
+		drag_anchor_mx=mouse_px;
+		drag_anchor_my=mouse_py;
 		transient_x=0.0;
 		transient_y=0.0;
 		}
@@ -386,8 +469,8 @@ void update_camera(
 			}
 		else if(gps!=nullptr)
 			{
-			double vx=drag_anchor_vx-double(gps->precise_mouse_x-drag_anchor_mx)/tile;
-			double vy=drag_anchor_vy-double(gps->precise_mouse_y-drag_anchor_my)/tile;
+			double vx=drag_anchor_vx-double(mouse_px-drag_anchor_mx)/tile;
+			double vy=drag_anchor_vy-double(mouse_py-drag_anchor_my)/tile;
 			rest_x=content_wx-vx;
 			rest_y=content_wy-vy;
 			// If DF's own drag disagrees by more than a tile and a half, rebase on its view.
@@ -397,9 +480,9 @@ void update_camera(
 				rest_x=std::clamp(rest_x,-lim,lim);
 				rest_y=std::clamp(rest_y,-lim,lim);
 				drag_anchor_vx=content_wx-rest_x+
-					double(gps->precise_mouse_x-drag_anchor_mx)/tile;
+					double(mouse_px-drag_anchor_mx)/tile;
 				drag_anchor_vy=content_wy-rest_y+
-					double(gps->precise_mouse_y-drag_anchor_my)/tile;
+					double(mouse_py-drag_anchor_my)/tile;
 				}
 			}
 		}
@@ -555,7 +638,9 @@ viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp)
 		visual_layers(const_viewport),
 		visual_layers(const_viewport,true),
 		window_x?*window_x:0,
-		window_y?*window_y:0
+		window_y?*window_y:0,
+		vp->screentexpos_background,
+		vp->screentexpos_background_old
 		};
 }
 
@@ -1351,6 +1436,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	const int32_t glide_x=int32_t(std::lround(transient_x+rest_x*cam_tile));
 	const int32_t glide_y=int32_t(std::lround(transient_y+rest_y*cam_tile));
 	const bool glide=glide_x!=0||glide_y!=0;
+	compensate_mouse(renderer,vp,glide_x,glide_y,enabler!=nullptr&&enabler->mouse_mbut);
 	if(!glide&&camera_was_offset)
 		{
 		// The camera just re-joined the grid: one engine redraw replaces the last shifted frame.
@@ -1558,6 +1644,8 @@ command_result status_command(
 		out.print("frames seen {} | frames animating {} | animation bursts {}\n",
 			dbg_frames,dbg_anim_frames,dbg_runs);
 		out.print("last burst {} ms | longest burst {} ms\n",dbg_last_run_ms,dbg_longest_run_ms);
+		out.print("mouse compensation: tile shift {} {} (0 0 when the view is not offset)\n",
+			dbg_mouse_dx,dbg_mouse_dy);
 		out.print("camera: scrolls {} | landed {} | waits {} | drag frames {}\n",
 		dbg_cam_scrolls,dbg_cam_landed,dbg_cam_waits,dbg_cam_drag_frames);
 		out.print("camera misses (each can jerk): timeouts {} | no-data {} | too-far {} | jumps {}\n",
@@ -1740,6 +1828,7 @@ DFhackCExport command_result plugin_enable(color_ostream &out,bool enable)
 	else
 		{
 		INTERPOSE_HOOK(renderer_hook,update_all).remove();
+		restore_mouse();
 		reset_state();
 		clear_sdl_bindings();
 		if(gps!=nullptr)++gps->force_full_display_count;
