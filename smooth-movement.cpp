@@ -51,7 +51,7 @@ REQUIRE_GLOBAL(world);
 
 namespace {
 
-constexpr const char *plugin_version="0.10.2-adv";
+constexpr const char *plugin_version="0.10.5-adv";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -152,7 +152,8 @@ void apply_animation_settings()
 //   transient -- the decaying scroll glide from before, in pixels, layered on top.
 // Render offset = transient + rest*tile. window_x/window_y remain the game's own tile camera.
 bool camera_enabled=true;                     // ON by default; `smooth-movement-adv camera off` to disable
-constexpr int32_t camera_max_glide_tiles=3;   // per-jump: farther than this snaps instantly
+constexpr int32_t camera_max_glide_tiles=3;   // scrolls up to this size are matched tile by tile
+constexpr int32_t camera_max_recenter_tiles=48;   // a bigger jump (the game re-centring after a pan) still glides; farther snaps
 constexpr double camera_tau_ms=35.0;          // transient catch-up (~95% done after 100ms)
 double transient_x=0.0;                       // decaying glide offset, pixels
 double transient_y=0.0;
@@ -170,6 +171,7 @@ int32_t drag_anchor_mx=0;                     // precise mouse at drag start, pi
 int32_t drag_anchor_my=0;
 bool camera_was_offset=false;                 // edge-detects offset->0 for one cleanup redraw
 int32_t camera_prev_wx=0;                     // window-scroll observation baseline
+uint32_t dbg_cam_big=0;          // big re-centre jumps followed smoothly
 uint32_t dbg_line_starts=0;      // straight-line walks started
 uint32_t dbg_line_frames=0;      // frames the straight-line camera drove the view
 uint32_t dbg_dest_seen=0;        // frames the adventurer had a destination
@@ -195,6 +197,7 @@ struct line_followst
 	double ref_u=0.0;                        // for measuring the walking speed
 	double ref_ms=0.0;
 	double elapsed_ms=0.0;
+	bool finishing=false;                    // the walk ended: glide the rest of the way to the game's view
 	int32_t dest_x=-30000,dest_y=-30000;
 };
 line_followst line_follow;
@@ -285,6 +288,7 @@ void compensate_mouse(
 // map are shifted here by the camera's sub-tile offset: the game then works out the tile under the
 // pointer from a position that already matches the shifted picture. WORKAROUND: this edits the
 // mouse events' pixel positions, not a game feature. Not applied while middle-mouse panning.
+bool mouse_fix=true;                  // `camera mouse on|off`: the mouse offset workaround
 bool sdl_mouse_seen=false;            // the event hook has been called at least once
 double sdl_mouse_scale=1.0;           // window pixels per render pixel (`camera mouse <scale>`)
 uint32_t dbg_sdl_events=0;
@@ -427,7 +431,7 @@ void attribute_landed(int32_t ax,int32_t ay,double tile)
 		{
 		transient_x+=gx*tile;
 		transient_y+=gy*tile;
-		const double cap=tile*(camera_max_glide_tiles+0.5);
+		const double cap=tile*(camera_max_recenter_tiles+0.5);
 		transient_x=std::clamp(transient_x,-cap,cap);
 		transient_y=std::clamp(transient_y,-cap,cap);
 		}
@@ -494,8 +498,37 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 	const bool travelling=dest_x!=-30000&&dest_z==adv->pos.z&&
 		(dest_x!=adv->pos.x||dest_y!=adv->pos.y);
 	if(dest_x!=-30000)++dbg_dest_seen;
-	if(!travelling){line_follow.active=false;line_follow.dest_x=-30000;return false;}
 	line_followst &lf=line_follow;
+	const bool linear=cam_ease==1||(cam_ease==0&&linear_ease_user);
+	if(!travelling&&lf.active)lf.finishing=true;
+	if(lf.finishing)
+		{
+		// The walk is over. Don't hand the camera back to the quick decay (that snapped on the last
+		// step whenever the camera was still part-way): keep gliding at the same steady speed
+		// until it sits on the game's view, then let go.
+		lf.dest_x=-30000;
+		const double fx=cwx-lf.cam_x;
+		const double fy=cwy-lf.cam_y;
+		const double dist=std::hypot(fx,fy);
+		if(dist<0.03)
+			{
+			lf.active=false;
+			lf.finishing=false;
+			transient_x=0.0;
+			transient_y=0.0;
+			return false;
+			}
+		double v=std::max(3.0,lf.speed*2.0);
+		if(!linear)v=std::min(v,std::max(0.5,dist*3.0));
+		const double step=std::min(dist,v*double(dt)/1000.0);
+		lf.cam_x+=fx/dist*step;
+		lf.cam_y+=fy/dist*step;
+		transient_x=(cwx-lf.cam_x)*tile;
+		transient_y=(cwy-lf.cam_y)*tile;
+		++dbg_line_frames;
+		return true;
+		}
+	if(!travelling){line_follow.active=false;line_follow.dest_x=-30000;return false;}
 	if(!lf.active||dest_x!=lf.dest_x||dest_y!=lf.dest_y)
 		{
 		// start from wherever the camera is on screen right now, so nothing jumps
@@ -510,6 +543,7 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 		lf.ey=double(dest_y)+lf.off_y;
 		++dbg_line_starts;
 		lf.active=true;
+		lf.finishing=false;
 		lf.dest_x=dest_x;
 		lf.dest_y=dest_y;
 		lf.sx=cx;
@@ -526,7 +560,7 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 	const double vx=lf.ex-lf.sx;
 	const double vy=lf.ey-lf.sy;
 	const double len=std::hypot(vx,vy);
-	if(len<0.75){lf.active=false;return false;}   // practically there: ordinary glide
+	if(len<0.75){lf.finishing=true;return false;}   // practically there: finish gliding next frame
 	++dbg_line_frames;
 	const double dx=vx/len,dy=vy/len;
 	const double dtd=double(dt);
@@ -542,12 +576,13 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 		lf.ref_u=ut;
 		lf.ref_ms=0.0;
 		}
-	const bool linear=cam_ease==1||(cam_ease==0&&linear_ease_user);
 	// the character's progress, smoothed so its tile steps don't show: it advances at the walking
 	// speed and is only gently pulled toward the real position
 	lf.cu+=lf.speed*dtd/1000.0;
 	lf.cu+=(ut-lf.cu)*(1.0-std::exp(-dtd/300.0));
-	lf.cu=std::clamp(lf.cu,0.0,len);
+	// never more than a tile from where the character really is: otherwise the camera runs so far
+	// ahead that the safety limit below ties it to the game's tile-stepped view (a visible stutter)
+	lf.cu=std::clamp(lf.cu,std::max(0.0,ut-1.0),std::min(len,ut+1.0));
 	// The camera moves on its own: off toward a point up to `lead` tiles ahead of the character
 	// (or the destination), at a steady speed faster than walking, then waits there for the
 	// character to catch up.
@@ -570,7 +605,7 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 	lf.cam_y=lf.sy+dy*lf.u;
 	double tx=(cwx-lf.cam_x)*tile;
 	double ty=(cwy-lf.cam_y)*tile;
-	const double lim=(line_lead_tiles+2.0)*tile;
+	const double lim=(line_lead_tiles+4.0)*tile;
 	const double mag=std::hypot(tx,ty);
 	if(mag>lim)
 		{
@@ -639,7 +674,7 @@ void update_camera(
 		{
 		const int32_t dx=wx-camera_prev_wx;
 		const int32_t dy=wy-camera_prev_wy;
-		if((std::abs(dx)>camera_max_glide_tiles||std::abs(dy)>camera_max_glide_tiles)&&
+		if((std::abs(dx)>camera_max_recenter_tiles||std::abs(dy)>camera_max_recenter_tiles)&&
 			!drag_active)
 			{
 			cancel_camera_transients();   // teleport-like jump (recenter/minimap): snap
@@ -660,15 +695,36 @@ void update_camera(
 	if(camera_pending_dx!=0||camera_pending_dy!=0)
 		{
 		if(std::abs(camera_pending_dx)>6||std::abs(camera_pending_dy)>6)
-			{
-			// Scrolling far outran detection: snap (keep rest, drop the animation debt).
-			transient_x=0.0;
-			transient_y=0.0;
-			clear_camera_pending();
-			++dbg_cam_overflow;
-			}
-			else
-			{
+		{
+		// A big jump (the game re-centring on the character after a pan). Only two outcomes are
+		// possible: the buffers still show the old view, or they already show the whole jump.
+		const double s_full=background_match_ratio(vp,camera_pending_dx,camera_pending_dy);
+		const double s_zero=background_match_ratio(vp,0,0);
+		if(s_full<0.0)
+		{
+		clear_camera_pending();
+		++dbg_cam_nodata;
+		}
+		else if(s_full>=0.6&&s_full>s_zero+0.05)
+		{
+		attribute_landed(camera_pending_dx,camera_pending_dy,tile);
+		clear_camera_pending();
+		++dbg_cam_landed;
+		++dbg_cam_big;
+		}
+		else if(s_zero>=0.6)
+		{
+		camera_pending_frames=0;
+		++dbg_cam_waits;
+		}
+		else if(++camera_pending_frames>6)
+		{
+		clear_camera_pending();
+		++dbg_cam_overflow;
+		}
+		}
+		else
+		{
 			// Fast scrolling applies the pending delta PIECEMEAL: the buffers may hold +1 of a
 			// pending +3 this frame. Testing only the total made landings miss, time out, and
 			// snap -- the fast-scroll jitter. Instead, find the LARGEST applied prefix of the
@@ -775,12 +831,25 @@ void update_camera(
 			}
 		}
 
+	if(drag_active)line_follow.active=false;
 	if(!drag_active&&line_step(tile,content_wx,content_wy,wx,wy,delta_ms))return;
 	if(transient_x!=0.0||transient_y!=0.0)
 	{
 	const uint32_t cam_ms=cam_speed_ms>0?cam_speed_ms:effective_step_ms;
-		const bool cam_linear=cam_ease==1||(cam_ease==0&&linear_ease_user);
-		if(cam_linear)
+	const bool cam_linear=cam_ease==1||(cam_ease==0&&linear_ease_user);
+	if(std::hypot(transient_x,transient_y)>1.5*tile)
+	{
+	// A long way to go (the game re-centred after a pan): travel at a steady speed, easing out
+	// unless linear, instead of the fast short-range catch-up.
+	const double mag=std::hypot(transient_x,transient_y);
+	double v=std::max(6.0,1000.0/double(std::max<uint32_t>(cam_ms,1)));   // tiles per second
+	if(!cam_linear)v=std::min(v,std::max(0.5,mag/tile*3.0));
+	const double step=v*tile*double(delta_ms)/1000.0;
+	const double scale=mag<=step?0.0:(mag-step)/mag;
+	transient_x*=scale;
+	transient_y*=scale;
+	}
+	else if(cam_linear)
 		{
 		// Constant-speed catch-up at one tile per step duration, so the world scrolls at the same
 		// pace the character walks and the character stays put on screen. (An exponential
@@ -1736,7 +1805,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	last_renderer=renderer;
 	last_vp=vp;
 	last_drag=enabler!=nullptr&&enabler->mouse_mbut;
-	if(!sdl_mouse_seen)
+	if(!sdl_mouse_seen&&mouse_fix)
 		compensate_mouse(renderer,vp,glide_x,glide_y,last_drag);
 	if(!glide&&camera_was_offset)
 		{
@@ -1899,6 +1968,7 @@ void reset_state()
 	line_follow=line_followst{};
 	line_lead_tiles=6.0;
 	sdl_mouse_scale=1.0;
+	mouse_fix=true;
 	effective_step_ms=100;
 	step_interval_ema=0.0;
 	last_land_ms=0;
@@ -1935,6 +2005,8 @@ out.print(
 "                          camera time per tile, ms (auto = step speed)\n"
 "  camera ease linear|smooth|auto\n"
 "                          camera easing (auto = step easing)\n"
+"  camera mouse on|off     mouse offset fix (default on); turn off to test\n"
+"                          whether it causes flicker near buildings\n"
 "  camera mouse <scale>    mouse offset scale (default 1.00); only change it\n"
 "                          if clicks are off, e.g. 2.00 or 0.50\n"
 "\n"
@@ -1978,7 +2050,7 @@ return CR_OK;
 			dbg_in_run=false;
 			dbg_cam_scrolls=dbg_cam_landed=dbg_cam_waits=dbg_cam_timeouts=0;
 			dbg_cam_nodata=dbg_cam_overflow=dbg_cam_jumps=dbg_cam_drag_frames=0;
-			dbg_line_starts=dbg_line_frames=dbg_dest_seen=0;
+			dbg_line_starts=dbg_line_frames=dbg_dest_seen=dbg_cam_big=0;
 			out.print("debug counters reset\n");
 			return CR_OK;
 			}
@@ -2012,14 +2084,15 @@ return CR_OK;
 		out.print("frames seen {} | frames animating {} | animation bursts {}\n",
 			dbg_frames,dbg_anim_frames,dbg_runs);
 		out.print("last burst {} ms | longest burst {} ms\n",dbg_last_run_ms,dbg_longest_run_ms);
+		out.print("mouse offset fix: {}\n",mouse_fix?"on":"off");
 		out.print("mouse via SDL events: hook {} | events {} | shifted {} | last shift {} {} px | scale {:.2f}\n",
 			sdl_mouse_seen?"called":"NOT called (using field edits)",dbg_sdl_events,dbg_sdl_shifted,
 			dbg_sdl_dx,dbg_sdl_dy,sdl_mouse_scale);
 		out.print("camera offset now: {} {} px\n",last_glide_x,last_glide_y);
 		out.print("mouse compensation: tile shift {} {} (0 0 when the view is not offset)\n",
 			dbg_mouse_dx,dbg_mouse_dy);
-		out.print("camera: scrolls {} | landed {} | waits {} | drag frames {}\n",
-		dbg_cam_scrolls,dbg_cam_landed,dbg_cam_waits,dbg_cam_drag_frames);
+		out.print("camera: scrolls {} | landed {} (big re-centres {}) | waits {} | drag frames {}\n",
+		dbg_cam_scrolls,dbg_cam_landed,dbg_cam_big,dbg_cam_waits,dbg_cam_drag_frames);
 		out.print("camera misses (each can jerk): timeouts {} | no-data {} | too-far {} | jumps {}\n",
 		dbg_cam_timeouts,dbg_cam_nodata,dbg_cam_overflow,dbg_cam_jumps);
 		out.print("Walk a few steps, then run this again; 'debug reset' clears the counters.\n");
@@ -2128,7 +2201,15 @@ return CR_OK;
 	{
 	if(parameters.size()==2)
 	{
-	out.print("mouse scale: {:.2f} (window pixels per render pixel)\n",sdl_mouse_scale);
+	out.print("mouse offset fix: {} | scale {:.2f} (window pixels per render pixel)\n",
+		mouse_fix?"on":"off",sdl_mouse_scale);
+	return CR_OK;
+	}
+	if(parameters.size()==3&&(parameters[2]=="on"||parameters[2]=="off"))
+	{
+	mouse_fix=parameters[2]=="on";
+	if(!mouse_fix)restore_mouse();   // give the game its own mouse values back
+	out.print("smooth-movement-adv: mouse offset fix {}\n",mouse_fix?"on":"off");
 	return CR_OK;
 	}
 	if(parameters.size()==3)
@@ -2311,7 +2392,7 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 		"smooth-movement-adv",
 		"Smooth movement status; free camera: camera on|off|reset|<fx> <fy>; "
 		"sprite flipping: flip on|off; step duration: speed <ms>; "
-		"easing: ease linear|smooth; straight-line camera: camera line on|off, camera lead <tiles>, camera mouse <scale>; camera speed and easing: camera speed <ms>|auto, camera ease linear|smooth|auto; self-check: debug [reset], trace start|stop; full list: help.",
+		"easing: ease linear|smooth; straight-line camera: camera line on|off, camera lead <tiles>, camera mouse on|off|<scale>; camera speed and easing: camera speed <ms>|auto, camera ease linear|smooth|auto; self-check: debug [reset], trace start|stop; full list: help.",
 		status_command);
 	return CR_OK;
 }
@@ -2351,7 +2432,7 @@ DFhackCExport command_result plugin_enable(color_ostream &out,bool enable)
 // game's mouse fields, as before, just earlier.
 DFhackCExport command_result plugin_onupdate(color_ostream &)
 {
-	if(!sdl_mouse_seen&&is_enabled&&camera_enabled&&last_renderer!=nullptr&&last_vp!=nullptr&&gps!=nullptr)
+	if(!sdl_mouse_seen&&mouse_fix&&is_enabled&&camera_enabled&&last_renderer!=nullptr&&last_vp!=nullptr&&gps!=nullptr)
 		compensate_mouse(last_renderer,last_vp,last_glide_x,last_glide_y,
 			enabler!=nullptr&&enabler->mouse_mbut);
 	return CR_OK;
@@ -2359,7 +2440,7 @@ DFhackCExport command_result plugin_onupdate(color_ostream &)
 
 DFhackCExport command_result plugin_sdl_event(color_ostream &,SDL_Event *event)
 {
-	if(event==nullptr||!is_enabled||!camera_enabled)return CR_OK;
+	if(event==nullptr||!is_enabled||!camera_enabled||!mouse_fix)return CR_OK;
 	if(!sdl_mouse_seen)
 		{
 		sdl_mouse_seen=true;
