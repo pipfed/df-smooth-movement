@@ -49,7 +49,7 @@ REQUIRE_GLOBAL(world);
 
 namespace {
 
-constexpr const char *plugin_version="0.8.0-adv";
+constexpr const char *plugin_version="0.9.0-adv";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -168,6 +168,9 @@ int32_t drag_anchor_mx=0;                     // precise mouse at drag start, pi
 int32_t drag_anchor_my=0;
 bool camera_was_offset=false;                 // edge-detects offset->0 for one cleanup redraw
 int32_t camera_prev_wx=0;                     // window-scroll observation baseline
+uint32_t dbg_line_starts=0;      // straight-line walks started
+uint32_t dbg_line_frames=0;      // frames the straight-line camera drove the view
+uint32_t dbg_dest_seen=0;        // frames the adventurer had a destination
 int32_t camera_prev_wy=0;
 bool camera_has_prev=false;
 
@@ -181,7 +184,8 @@ struct line_followst
 {
 	bool active=false;
 	double sx=0.0,sy=0.0;                    // line start, in window coordinates
-	double ex=0.0,ey=0.0;                    // destination, in window coordinates
+	double ex=0.0,ey=0.0;                    // destination, in window coordinates (fixed for the walk)
+	double off_x=0.0,off_y=0.0;              // camera minus character at the start of the walk
 	double cam_x=0.0,cam_y=0.0;              // the camera's own continuous position
 	double u=0.0;                            // camera distance along the line, tiles
 	double cu=0.0;                           // smoothed character progress along the line, tiles
@@ -266,6 +270,12 @@ void compensate_mouse(
 }
 
 // Gives the game its own values back (plugin disabled).
+// The last frame's camera offset, so the compensation can also run from the game's update tick.
+int32_t last_glide_x=0;
+int32_t last_glide_y=0;
+const df::renderer_2d_base *last_renderer=nullptr;
+const df::graphic_viewportst *last_vp=nullptr;
+
 void restore_mouse()
 {
 	if(gps==nullptr||!mouse_comp.has)return;
@@ -408,15 +418,22 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 	const int32_t dest_y=adv->path.dest.y;
 	const bool travelling=dest_x!=-30000&&adv->path.dest.z==adv->pos.z&&
 		(dest_x!=adv->pos.x||dest_y!=adv->pos.y);
+	if(dest_x!=-30000)++dbg_dest_seen;
 	if(!travelling){line_follow.active=false;line_follow.dest_x=-30000;return false;}
 	line_followst &lf=line_follow;
-	lf.ex=double(dest_x-adv->pos.x+wx);
-	lf.ey=double(dest_y-adv->pos.y+wy);
 	if(!lf.active||dest_x!=lf.dest_x||dest_y!=lf.dest_y)
 		{
 		// start from wherever the camera is on screen right now, so nothing jumps
 		const double cx=lf.active?lf.cam_x:cwx-transient_x/tile;
 		const double cy=lf.active?lf.cam_y:cwy-transient_y/tile;
+		// Fix the destination ONCE. (Recomputing it every frame from the character and the game's
+		// view made the end of the line wobble by a tile whenever the two updated on different
+		// frames, which bent the path into an arc.)
+		lf.off_x=cx-double(adv->pos.x);
+		lf.off_y=cy-double(adv->pos.y);
+		lf.ex=double(dest_x)+lf.off_x;
+		lf.ey=double(dest_y)+lf.off_y;
+		++dbg_line_starts;
 		lf.active=true;
 		lf.dest_x=dest_x;
 		lf.dest_y=dest_y;
@@ -435,6 +452,7 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 	const double vy=lf.ey-lf.sy;
 	const double len=std::hypot(vx,vy);
 	if(len<0.75){lf.active=false;return false;}   // practically there: ordinary glide
+	++dbg_line_frames;
 	const double dx=vx/len,dy=vy/len;
 	const double dtd=double(dt);
 	lf.elapsed_ms+=dtd;
@@ -1598,6 +1616,10 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	const int32_t glide_x=int32_t(std::lround(transient_x+rest_x*cam_tile));
 	const int32_t glide_y=int32_t(std::lround(transient_y+rest_y*cam_tile));
 	const bool glide=glide_x!=0||glide_y!=0;
+	last_glide_x=glide_x;
+	last_glide_y=glide_y;
+	last_renderer=renderer;
+	last_vp=vp;
 	compensate_mouse(renderer,vp,glide_x,glide_y,enabler!=nullptr&&enabler->mouse_mbut);
 	if(!glide&&camera_was_offset)
 		{
@@ -1826,6 +1848,7 @@ return CR_OK;
 			dbg_in_run=false;
 			dbg_cam_scrolls=dbg_cam_landed=dbg_cam_waits=dbg_cam_timeouts=0;
 			dbg_cam_nodata=dbg_cam_overflow=dbg_cam_jumps=dbg_cam_drag_frames=0;
+			dbg_line_starts=dbg_line_frames=dbg_dest_seen=0;
 			out.print("debug counters reset\n");
 			return CR_OK;
 			}
@@ -1836,6 +1859,14 @@ return CR_OK;
 		step_duration_ms,linear_ease_user?"linear":"smooth");
 		out.print("straight-line camera: {} | following a path now: {} | line end {:.1f} {:.1f}\n",
 		line_camera?"on":"off",line_follow.active?"YES":"no",line_follow.ex,line_follow.ey);
+		out.print("line camera: walks started {} | frames driven {} | frames with a destination {}\n",
+			dbg_line_starts,dbg_line_frames,dbg_dest_seen);
+		if(world!=nullptr&&!world->units.active.empty()&&world->units.active[0]!=nullptr)
+			{
+			const df::unit *a=world->units.active[0];
+			out.print("adventurer at {} {} {} | path dest {} {} {}\n",
+				a->pos.x,a->pos.y,a->pos.z,a->path.dest.x,a->path.dest.y,a->path.dest.z);
+			}
 		out.print("camera speed setting: {} | camera easing setting: {}\n",
 		cam_speed_ms==0?std::string("auto"):std::to_string(cam_speed_ms)+" ms",
 		cam_ease==1?"linear":cam_ease==2?"smooth":"auto");
@@ -2135,12 +2166,25 @@ DFhackCExport command_result plugin_enable(color_ostream &out,bool enable)
 		{
 		INTERPOSE_HOOK(renderer_hook,update_all).remove();
 		restore_mouse();
+		last_renderer=nullptr;
+		last_vp=nullptr;
 		reset_state();
 		clear_sdl_bindings();
 		if(gps!=nullptr)++gps->force_full_display_count;
 		}
 	is_enabled=enable;
 	out.print("smooth-movement-adv: {}\n",enable?"enabled":"disabled");
+	return CR_OK;
+}
+
+// Runs on the game's own update tick. The render hook alone corrects the mouse AFTER the game has
+// read it for that frame, so it only helped while the mouse was still. WORKAROUND: edits the
+// game's mouse fields, as before, just earlier.
+DFhackCExport command_result plugin_onupdate(color_ostream &)
+{
+	if(is_enabled&&camera_enabled&&last_renderer!=nullptr&&last_vp!=nullptr&&gps!=nullptr)
+		compensate_mouse(last_renderer,last_vp,last_glide_x,last_glide_y,
+			enabler!=nullptr&&enabler->mouse_mbut);
 	return CR_OK;
 }
 
