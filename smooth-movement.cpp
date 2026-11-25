@@ -48,7 +48,7 @@ REQUIRE_GLOBAL(world);
 
 namespace {
 
-constexpr const char *plugin_version="0.6.0-adv";
+constexpr const char *plugin_version="0.7.0-adv";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -72,12 +72,7 @@ int32_t previous_pan_y=0;
 bool has_pan_context=false;
 bool flip_enabled=false;
 
-// --- adventure mode tuning ------------------------------------------------------------------
-// Adventure mode scrolls the map by a tile on every step the player takes, and a steady run is
-// a chain of single-tile steps. Easing in and out of each one reads as stutter, and without the
-// camera glide the player stands still on screen while the whole map snaps. So in adventure mode
-// (when `adventure on`, the default) the free camera glide is switched on and steps ease linearly.
-// Leaving adventure mode restores what was set before. Fortress mode is untouched.
+// --- settings ---------------------------------------------------------------------------------
 uint32_t step_duration_ms=100;       // `smooth-movement-adv speed <ms>` (the shortest a step may take)
 bool adaptive_speed=true;            // `smooth-movement-adv adaptive on|off`
 uint32_t cam_speed_ms=0;             // `smooth-movement-adv camera speed <ms>|auto` (0 = follow steps)
@@ -88,9 +83,7 @@ uint32_t effective_step_ms=100;
 double step_interval_ema=0.0;
 uint32_t last_land_ms=0;
 bool linear_ease_user=false;         // `smooth-movement-adv ease linear|smooth`
-bool adventure_preset=true;          // `smooth-movement-adv adventure on|off`
-bool preset_active=false;
-bool preset_saved_camera=false;
+
 
 // Camera counters for `smooth-movement-adv debug`.
 uint32_t dbg_cam_scrolls=0;      // window scrolls observed
@@ -141,7 +134,7 @@ void apply_animation_settings()
 
 {
 	animation_manager.set_movement_duration_ms(effective_step_ms);
-	animation_manager.set_linear_easing(linear_ease_user||preset_active);
+	animation_manager.set_linear_easing(linear_ease_user);
 }
 
 // --- free camera -------------------------------------------------------------------------------
@@ -155,9 +148,7 @@ void apply_animation_settings()
 //                buffer data and stays black).
 //   transient -- the decaying scroll glide from before, in pixels, layered on top.
 // Render offset = transient + rest*tile. window_x/window_y remain the game's own tile camera.
-bool camera_enabled=false;                    // OFF by default: plain `enable smooth-movement-adv`
-                                              // keeps upstream behavior (creature interpolation
-                                              // only); `smooth-movement-adv camera on` opts in.
+bool camera_enabled=true;                     // ON by default; `smooth-movement-adv camera off` to disable
 constexpr int32_t camera_max_glide_tiles=3;   // per-jump: farther than this snaps instantly
 constexpr double camera_tau_ms=35.0;          // transient catch-up (~95% done after 100ms)
 double transient_x=0.0;                       // decaying glide offset, pixels
@@ -188,8 +179,14 @@ bool line_camera=true;                       // `smooth-movement-adv camera line
 struct line_followst
 {
 	bool active=false;
-	double sx=0.0,sy=0.0;                    // start, in window coordinates
+	double sx=0.0,sy=0.0;                    // line start, in window coordinates
 	double ex=0.0,ey=0.0;                    // destination, in window coordinates
+	double cam_x=0.0,cam_y=0.0;              // the camera's own continuous position
+	double u=0.0;                            // camera distance along the line, tiles
+	double speed=7.0;                        // camera speed along the line, tiles per second
+	double ref_u=0.0;                        // for measuring the walking speed
+	double ref_ms=0.0;
+	double elapsed_ms=0.0;
 	int32_t dest_x=-30000,dest_y=-30000;
 };
 line_followst line_follow;
@@ -335,20 +332,7 @@ void set_camera_enabled(bool enable)
 	// camera_was_offset stays: the render path issues one cleanup redraw if we were mid-offset.
 }
 
-// Called every frame, before the animation runs: cheap, only acts when the game mode changes.
-void update_mode_preset()
-{
-	const bool wanted=adventure_preset&&World::isAdventureMode();
-	if(wanted==preset_active)return;
-	preset_active=wanted;
-	if(wanted)
-		{
-		preset_saved_camera=camera_enabled;
-		set_camera_enabled(true);
-		}
-	else set_camera_enabled(preset_saved_camera);
-	apply_animation_settings();
-}
+
 
 // Fold whole tiles of rest into window_x/window_y so |rest| <= 0.5 (minimal edge strip). The
 // visual position is unchanged: the window write is attributed via self_scroll when it lands.
@@ -400,74 +384,100 @@ void attribute_landed(int32_t ax,int32_t ay,double tile)
 		}
 }
 
-// Per-frame camera bookkeeping: observe window scrolls, attribute them when the buffers apply
-// them (glide vs our own normalization writes), drive the drag, decay the transient.
-// Where the camera should be heading (as a transient offset in pixels): zero means "at the
-// character", anything else is the point on the straight line to the destination.
-void line_target(
-	double tile,
-	double content_wx,
-	double content_wy,
-	int32_t wx,
-	int32_t wy,
-	double &target_x,
-	double &target_y)
+// While the character walks to a click-to-move destination, the camera moves on its own: a
+// continuous position travels along the straight line from where it started to the destination at
+// the walking speed, and the world is drawn offset by (game view - camera). The character's tile
+// steps only nudge the speed estimate, so the camera never follows the stepped path.
+// Returns false when not travelling (the ordinary glide takes over).
+double smooth01(double t)
 {
-	target_x=0.0;
-	target_y=0.0;
+	t=std::clamp(t,0.0,1.0);
+	return t*t*(3.0-2.0*t);
+}
+
+bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t dt)
+{
 	if(!line_camera||world==nullptr||!World::isAdventureMode()||world->units.active.empty())
-		{
-		line_follow.active=false;
-		return;
-		}
+		{line_follow.active=false;return false;}
 	const df::unit *adv=world->units.active[0];
-	if(adv==nullptr)
-		{
-		line_follow.active=false;
-		return;
-		}
+	if(adv==nullptr){line_follow.active=false;return false;}
 	const int32_t dest_x=adv->path.dest.x;
 	const int32_t dest_y=adv->path.dest.y;
 	const bool travelling=dest_x!=-30000&&adv->path.dest.z==adv->pos.z&&
 		(dest_x!=adv->pos.x||dest_y!=adv->pos.y);
-	if(!travelling)
+	if(!travelling){line_follow.active=false;line_follow.dest_x=-30000;return false;}
+	line_followst &lf=line_follow;
+	lf.ex=double(dest_x-adv->pos.x+wx);
+	lf.ey=double(dest_y-adv->pos.y+wy);
+	if(!lf.active||dest_x!=lf.dest_x||dest_y!=lf.dest_y)
 		{
-		line_follow.active=false;
-		line_follow.dest_x=-30000;
-		return;
+		// start from wherever the camera is on screen right now, so nothing jumps
+		const double cx=lf.active?lf.cam_x:cwx-transient_x/tile;
+		const double cy=lf.active?lf.cam_y:cwy-transient_y/tile;
+		lf.active=true;
+		lf.dest_x=dest_x;
+		lf.dest_y=dest_y;
+		lf.sx=cx;
+		lf.sy=cy;
+		lf.cam_x=cx;
+		lf.cam_y=cy;
+		lf.u=0.0;
+		lf.ref_u=0.0;
+		lf.ref_ms=0.0;
+		lf.elapsed_ms=0.0;
+		lf.speed=1000.0/double(std::max<uint32_t>(cam_speed_ms>0?cam_speed_ms:effective_step_ms,1));
 		}
-	// the destination in window coordinates: the window follows the character
-	line_follow.ex=double(dest_x-adv->pos.x+wx);
-	line_follow.ey=double(dest_y-adv->pos.y+wy);
-	if(!line_follow.active||dest_x!=line_follow.dest_x||dest_y!=line_follow.dest_y)
+	const double vx=lf.ex-lf.sx;
+	const double vy=lf.ey-lf.sy;
+	const double len=std::hypot(vx,vy);
+	if(len<0.75){lf.active=false;return false;}   // practically there: ordinary glide
+	const double dx=vx/len,dy=vy/len;
+	const double dtd=double(dt);
+	lf.elapsed_ms+=dtd;
+	// where the character's own steps have got to along the line
+	const double ut=std::clamp((cwx-lf.sx)*dx+(cwy-lf.sy)*dy,0.0,len);
+	// walking speed along the line, measured over ~0.4s windows (unless the speed is fixed)
+	lf.ref_ms+=dtd;
+	if(lf.ref_ms>=400.0)
 		{
-		line_follow.active=true;
-		line_follow.dest_x=dest_x;
-		line_follow.dest_y=dest_y;
-		line_follow.sx=content_wx;
-		line_follow.sy=content_wy;
+		const double v=(ut-lf.ref_u)*1000.0/lf.ref_ms;
+		if(cam_speed_ms==0&&v>0.3)lf.speed=std::clamp(0.5*lf.speed+0.5*v,0.5,40.0);
+		lf.ref_u=ut;
+		lf.ref_ms=0.0;
 		}
-	const double vx=line_follow.ex-line_follow.sx;
-	const double vy=line_follow.ey-line_follow.sy;
-	const double len2=vx*vx+vy*vy;
-	if(len2<1.0)return;   // practically there already
-	double u=((content_wx-line_follow.sx)*vx+(content_wy-line_follow.sy)*vy)/len2;
-	u=std::clamp(u,0.0,1.0);
-	double tx=line_follow.sx+vx*u;
-	double ty=line_follow.sy+vy*u;
-	// never let the character drift far from the middle of the screen
-	const double lx=content_wx-tx;
-	const double ly=content_wy-ty;
-	const double drift=std::hypot(lx,ly);
-	if(drift>line_max_drift_tiles)
+	const bool linear=cam_ease==1||(cam_ease==0&&linear_ease_user);
+	double factor=1.0;
+	if(!linear)
 		{
-		tx=content_wx-lx*line_max_drift_tiles/drift;
-		ty=content_wy-ly*line_max_drift_tiles/drift;
+		const uint32_t cam_ms=cam_speed_ms>0?cam_speed_ms:effective_step_ms;
+		factor=std::max(0.2,smooth01(lf.elapsed_ms/(3.0*double(cam_ms))))*
+			std::max(0.15,smooth01((len-lf.u)/2.0));
 		}
-	target_x=(content_wx-tx)*tile;
-	target_y=(content_wy-ty)*tile;
+	// a gentle pull toward the character keeps the camera honest about speed changes
+	lf.u+=(ut-lf.u)*(1.0-std::exp(-dtd/800.0));
+	lf.u+=lf.speed*factor*dtd/1000.0;
+	lf.u=std::clamp(lf.u,0.0,len);
+	lf.cam_x=lf.sx+dx*lf.u;
+	lf.cam_y=lf.sy+dy*lf.u;
+	double tx=(cwx-lf.cam_x)*tile;
+	double ty=(cwy-lf.cam_y)*tile;
+	const double lim=line_max_drift_tiles*tile;
+	const double mag=std::hypot(tx,ty);
+	if(mag>lim)
+		{
+		tx*=lim/mag;
+		ty*=lim/mag;
+		lf.cam_x=cwx-tx/tile;
+		lf.cam_y=cwy-ty/tile;
+		}
+	transient_x=tx;
+	transient_y=ty;
+	return true;
 }
 
+// Per-frame camera bookkeeping: observe window scrolls, attribute them when the buffers apply
+// them (glide vs our own normalization writes), drive the drag, then either follow the straight
+// line to a destination or decay the transient.
 void update_camera(
 	df::renderer_2d_base *renderer,
 	const df::graphic_viewportst *vp,
@@ -617,15 +627,11 @@ void update_camera(
 			}
 		}
 
-	double target_x=0.0,target_y=0.0;
-	if(!drag_active)line_target(tile,content_wx,content_wy,wx,wy,target_x,target_y);
-	if(transient_x!=target_x||transient_y!=target_y)
+	if(!drag_active&&line_step(tile,content_wx,content_wy,wx,wy,delta_ms))return;
+	if(transient_x!=0.0||transient_y!=0.0)
 	{
-	// everything below moves the camera toward (target_x,target_y); zero when following the character
-	transient_x-=target_x;
-	transient_y-=target_y;
 	const uint32_t cam_ms=cam_speed_ms>0?cam_speed_ms:effective_step_ms;
-		const bool cam_linear=cam_ease==1||(cam_ease==0&&(preset_active||linear_ease_user));
+		const bool cam_linear=cam_ease==1||(cam_ease==0&&linear_ease_user);
 		if(cam_linear)
 		{
 		// Constant-speed catch-up at one tile per step duration, so the world scrolls at the same
@@ -651,8 +657,6 @@ void update_camera(
 		transient_x=0.0;
 		transient_y=0.0;
 		}
-		transient_x+=target_x;
-		transient_y+=target_y;
 		}
 		}
 
@@ -1562,7 +1566,7 @@ void render_interpolated_world(df::renderer_2d_base *renderer)
 	df::graphic_viewportst *vp=gps?gps->main_viewport:nullptr;
 	const std::vector<df::graphic_viewportst *> viewports=active_viewports();
 
-	update_mode_preset();
+	
 	if(vp!=nullptr)update_visual_context(renderer,vp);
 	const uint32_t now_ms=Core::getInstance().p->getTickCount();
 	animation_manager.begin_frame(now_ms);
@@ -1729,7 +1733,7 @@ void reset_state()
 	cancel_camera_transients();
 	rest_x=0.0;
 	rest_y=0.0;
-	camera_enabled=false;
+	camera_enabled=true;
 	camera_has_prev=false;
 	camera_was_offset=false;
 	flip_enabled=false;
@@ -1743,9 +1747,7 @@ void reset_state()
 	last_land_ms=0;
 	adaptive_speed=true;
 	linear_ease_user=false;
-	adventure_preset=true;
-	preset_active=false;
-	preset_saved_camera=false;
+	
 	apply_animation_settings();
 }
 
@@ -1757,14 +1759,14 @@ out.print(
 "  (nothing)                     show the current status\n"
 "  debug [reset]                 self-check numbers: settings in effect, step and camera counters\n"
 "  speed <20-500>                shortest time a tile step takes, in ms (default 100)\n"
-"  ease linear|smooth            easing of the step animation (adventure mode forces linear)\n"
+"  ease linear|smooth            easing of the step animation (default smooth)\n"
 "  adaptive on|off               stretch steps to how often they really arrive (default on)\n"
-"  adventure on|off              adventure mode tuning: linear steps and the free camera (default on)\n"
-"  camera on|off|reset           free camera: on, off, or clear its sub-tile offset\n"
+
+"  camera on|off|reset           free camera: on (default), off, or clear its sub-tile offset\n"
 "  camera <fx> <fy>              park the camera at an offset in tiles (-0.99..0.99)\n"
-"  camera line on|off            follow a straight line to a click-to-move destination (default on)\n"
+"  camera line on|off            glide in a straight line to a click-to-move destination (default on)\n"
 "  camera speed <20-1000>|auto   camera glide time per tile in ms; auto follows the step speed\n"
-"  camera ease linear|smooth|auto   camera glide easing; auto follows the step easing\n"
+"  camera ease linear|smooth|auto   camera glide easing; auto follows the step easing (default smooth)\n"
 "  flip on|off                   flip creature sprites toward their direction of travel\n"
 "Settings reset to their defaults whenever the plugin is enabled.\n");
 }
@@ -1790,9 +1792,7 @@ return CR_OK;
 		out.print("sprite flipping: {}\n",
 			flip_enabled?"on":"off");
 		out.print("step duration: {} ms, easing: {}\n",
-			step_duration_ms,(linear_ease_user||preset_active)?"linear":"smooth");
-		out.print("adventure mode tuning: {}{}\n",
-		adventure_preset?"on":"off",preset_active?" (active now)":"");
+			step_duration_ms,linear_ease_user?"linear":"smooth");
 		out.print("camera speed: {} | camera easing: {} | straight-line camera: {}\n",
 		cam_speed_ms==0?std::string("auto"):std::to_string(cam_speed_ms)+" ms",
 		cam_ease==1?"linear":cam_ease==2?"smooth":"auto",line_camera?"on":"off");
@@ -1814,8 +1814,8 @@ return CR_OK;
 		out.print("== smooth-movement-adv debug ==\n");
 		out.print("version {} | enabled: {} | adventure mode: {}\n",
 			plugin_version,is_enabled?"yes":"no",World::isAdventureMode()?"yes":"no");
-		out.print("setting: speed {} ms, user-linear {}, adventure tuning {}\n",
-			step_duration_ms,linear_ease_user?"yes":"no",adventure_preset?"on":"off");
+		out.print("setting: speed {} ms, step easing {}\n",
+		step_duration_ms,linear_ease_user?"linear":"smooth");
 		out.print("straight-line camera: {} | following a path now: {} | line end {:.1f} {:.1f}\n",
 		line_camera?"on":"off",line_follow.active?"YES":"no",line_follow.ex,line_follow.ey);
 		out.print("camera speed setting: {} | camera easing setting: {}\n",
@@ -1823,11 +1823,10 @@ return CR_OK;
 		cam_ease==1?"linear":cam_ease==2?"smooth":"auto");
 		out.print("adaptive speed: {} | measured step interval {:.0f} ms | step in use {} ms\n",
 		adaptive_speed?"on":"off",step_interval_ema,effective_step_ms);
-		out.print("in effect: preset active {} | manager duration {} ms | easing {}\n",
-			preset_active?"YES":"no",animation_manager.get_movement_duration_ms(),
-			animation_manager.get_linear_easing()?"linear":"smooth");
-		out.print("free camera: {} (preset saved previous camera: {})\n",
-			camera_enabled?"on":"off",preset_saved_camera?"on":"off");
+		out.print("in effect: manager duration {} ms | step easing {}\n",
+		animation_manager.get_movement_duration_ms(),
+		animation_manager.get_linear_easing()?"linear":"smooth");
+		out.print("free camera: {}\n",camera_enabled?"on":"off");
 		out.print("frames seen {} | frames animating {} | animation bursts {}\n",
 			dbg_frames,dbg_anim_frames,dbg_runs);
 		out.print("last burst {} ms | longest burst {} ms\n",dbg_last_run_ms,dbg_longest_run_ms);
@@ -1894,37 +1893,19 @@ return CR_OK;
 		{
 		if(parameters.size()==1)
 			{
-			out.print("easing: {}\n",(linear_ease_user||preset_active)?"linear":"smooth");
+			out.print("easing: {}\n",linear_ease_user?"linear":"smooth");
 			return CR_OK;
 			}
 		if(parameters.size()==2&&(parameters[1]=="linear"||parameters[1]=="smooth"))
 			{
 			linear_ease_user=parameters[1]=="linear";
 			apply_animation_settings();
-			out.print("smooth-movement-adv: easing {}\n",
-				(linear_ease_user||preset_active)?"linear":"smooth");
+			out.print("smooth-movement-adv: easing {}\n",linear_ease_user?"linear":"smooth");
 			return CR_OK;
 			}
 		return CR_WRONG_USAGE;
 		}
-	if(parameters[0]=="adventure")
-		{
-		if(parameters.size()==1)
-			{
-			out.print("adventure mode tuning: {}{}\n",
-				adventure_preset?"on":"off",preset_active?" (active now)":"");
-			return CR_OK;
-			}
-		if(parameters.size()==2&&(parameters[1]=="on"||parameters[1]=="off"))
-			{
-			adventure_preset=parameters[1]=="on";
-			update_mode_preset();   // apply or undo right away
-			out.print("smooth-movement-adv: adventure mode tuning {}\n",
-				adventure_preset?"on":"off");
-			return CR_OK;
-			}
-		return CR_WRONG_USAGE;
-		}
+	
 	if(parameters[0]=="camera")
 	{
 	if(parameters.size()>=2&&parameters[1]=="line")
@@ -2095,7 +2076,7 @@ plugin_init(color_ostream &,std::vector<PluginCommand> &commands)
 		"smooth-movement-adv",
 		"Smooth movement status; free camera: camera on|off|reset|<fx> <fy>; "
 		"sprite flipping: flip on|off; step duration: speed <ms>; "
-		"easing: ease linear|smooth; adventure mode tuning: adventure on|off; camera path: camera line on|off; camera speed and easing: camera speed <ms>|auto, camera ease linear|smooth|auto; self-check: debug [reset]; full list: help.",
+		"easing: ease linear|smooth; straight-line camera: camera line on|off; camera speed and easing: camera speed <ms>|auto, camera ease linear|smooth|auto; self-check: debug [reset]; full list: help.",
 		status_command);
 	return CR_OK;
 }
