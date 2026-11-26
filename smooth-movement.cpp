@@ -52,7 +52,7 @@ REQUIRE_GLOBAL(world);
 
 namespace {
 
-constexpr const char *plugin_version="0.11.1-adv";
+constexpr const char *plugin_version="0.11.3-adv";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -211,8 +211,14 @@ line_followst line_follow;
 // character, in tiles). Starts as half the map view and is refined while standing still.
 double centered_off_x=0.0,centered_off_y=0.0;
 bool centered_valid=false;
-bool centered_learned=false;
 double centered_idle_ms=0.0;
+double drag_quiet_ms=0.0;          // counts down after a pan: no votes while the view may be panned
+int32_t idle_ox=0,idle_oy=0;
+bool idle_voted=false;
+bool have_vote=false;
+double vote_off_x=0.0,vote_off_y=0.0;
+struct offset_votest{int32_t x,y,count;};
+std::vector<offset_votest> offset_votes;   // in the order first seen
 double line_lead_tiles=6.0;                  // `camera lead <tiles>`: how far ahead of the character the camera may wait
 
 // The unit the player controls in adventure mode. (world->units.active[0] is NOT reliably the
@@ -570,13 +576,28 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 		{line_follow.active=false;return false;}
 	const df::unit *adv=player_unit();
 	if(adv==nullptr){line_follow.active=false;return false;}
-	if(!centered_valid&&gps!=nullptr&&gps->main_viewport!=nullptr&&gps->main_viewport->dim_x>0)
-		{
-		// the window's corner sits half a view up and to the left of the character
-		centered_off_x=-double(gps->main_viewport->dim_x/2);
-		centered_off_y=-double(gps->main_viewport->dim_y/2);
-		centered_valid=true;
-		}
+	{
+		// Centred on the character means the character sits in the middle of the map area, so the
+		// view's corner is half the map area up and to the left of them. The map area's own size
+		// gives that directly (the whole grid, `dim`, includes the side panels and is wrong).
+		const df::graphic_viewportst *mv=gps!=nullptr?gps->main_viewport:nullptr;
+		if(mv!=nullptr&&mv->clipx[1]>mv->clipx[0]&&mv->clipy[1]>mv->clipy[0])
+			{
+			const double ex=-double((mv->clipx[1]-mv->clipx[0]+1)/2);
+			const double ey=-double((mv->clipy[1]-mv->clipy[0]+1)/2);
+			// a learned value only ever fine-tunes the estimate (rounding), never replaces it
+			if(have_vote&&std::abs(vote_off_x-ex)<=1.5&&std::abs(vote_off_y-ey)<=1.5)
+				{centered_off_x=vote_off_x;centered_off_y=vote_off_y;}
+			else{centered_off_x=ex;centered_off_y=ey;}
+			centered_valid=true;
+			}
+		else if(have_vote)
+			{
+			centered_off_x=vote_off_x;
+			centered_off_y=vote_off_y;
+			centered_valid=true;
+			}
+	}
 	int32_t dest_x=adv->path.dest.x;
 	int32_t dest_y=adv->path.dest.y;
 	int32_t dest_z=adv->path.dest.z;
@@ -599,26 +620,42 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 	const bool linear=cam_ease==1||(cam_ease==0&&linear_ease_user);
 	const double dtd=double(dt);
 	if(!travelling&&lf.active)lf.finishing=true;
-	if(!travelling&&!lf.active&&centered_valid)
+	drag_quiet_ms=std::max(0.0,drag_quiet_ms-dtd);
+	if(!travelling&&!lf.active)
 		{
-		// standing still: learn where the view sits when it is centred (only ever by small steps,
-		// so a panned view can't be mistaken for the centred one)
-		const double ox=cwx-double(adv->pos.x);
-		const double oy=cwy-double(adv->pos.y);
-		// (the first time, accept anything near the estimate: it is only a guess from the view size)
-		const double tol=centered_learned?1.01:6.0;
-		if(std::abs(ox-centered_off_x)<=tol&&std::abs(oy-centered_off_y)<=tol&&
-			transient_x==0.0&&transient_y==0.0)
+		// Standing still: note where the view sits relative to the character. The most common
+		// resting offset is the centred one (a pan is rare, short-lived and not repeated), so
+		// that is what the camera aims for. Nothing is assumed about the view size.
+		const int32_t ox=int32_t(std::lround(cwx-double(adv->pos.x)));
+		const int32_t oy=int32_t(std::lround(cwy-double(adv->pos.y)));
+		if(ox!=idle_ox||oy!=idle_oy||transient_x!=0.0||transient_y!=0.0)
+			{
+			idle_ox=ox;
+			idle_oy=oy;
+			centered_idle_ms=0.0;
+			idle_voted=false;
+			}
+		else
 			{
 			centered_idle_ms+=dtd;
-			if(centered_idle_ms>800.0)
+			if(centered_idle_ms>1500.0&&!idle_voted&&drag_quiet_ms<=0.0)
 				{
-				centered_off_x=ox;
-				centered_off_y=oy;
-				centered_learned=true;
+				idle_voted=true;
+				bool found=false;
+				for(offset_votest &v:offset_votes)
+					if(v.x==ox&&v.y==oy){++v.count;found=true;}
+				if(!found&&offset_votes.size()<16)offset_votes.push_back({ox,oy,1});
+				const offset_votest *best=nullptr;
+				for(const offset_votest &v:offset_votes)
+					if(best==nullptr||v.count>best->count)best=&v;
+				if(best!=nullptr)
+					{
+					vote_off_x=double(best->x);
+					vote_off_y=double(best->y);
+					have_vote=true;
+					}
 				}
 			}
-		else centered_idle_ms=0.0;
 		}
 	if(lf.finishing)
 		{
@@ -664,9 +701,13 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 		// The camera travels from B to the destination (C): the view that is centred on C, which
 		// is C plus the centred offset. Fixed once, here. (Recomputing it every frame bent the
 		// path into an arc.) Any pan is therefore cancelled by the journey itself.
-		lf.ex=double(dest_x)+centered_off_x;
-		lf.ey=double(dest_y)+centered_off_y;
-		lf.pan_tiles=std::hypot(cx-(double(adv->pos.x)+centered_off_x),cy-(double(adv->pos.y)+centered_off_y));
+		// (Until the centred offset has been learned, keep the current pan: aim at the destination
+		// as seen from B.)
+		const double off_x=centered_valid?centered_off_x:cx-double(adv->pos.x);
+		const double off_y=centered_valid?centered_off_y:cy-double(adv->pos.y);
+		lf.ex=double(dest_x)+off_x;
+		lf.ey=double(dest_y)+off_y;
+		lf.pan_tiles=std::hypot(cx-(double(adv->pos.x)+off_x),cy-(double(adv->pos.y)+off_y));
 		lf.start_px=double(adv->pos.x);
 		lf.start_py=double(adv->pos.y);
 		lf.d0=std::max(1.0,std::hypot(double(dest_x)-lf.start_px,double(dest_y)-lf.start_py));
@@ -974,7 +1015,12 @@ void update_camera(
 			}
 		}
 
-	if(drag_active)line_follow.active=false;
+	if(drag_active)
+		{
+		line_follow.active=false;
+		drag_quiet_ms=30000.0;
+		centered_idle_ms=0.0;
+		}
 	if(!drag_active&&line_step(tile,content_wx,content_wy,wx,wy,delta_ms))return;
 	if(transient_x!=0.0||transient_y!=0.0)
 	{
@@ -2111,8 +2157,11 @@ void reset_state()
 	line_camera=true;
 	line_follow=line_followst{};
 	centered_valid=false;
-	centered_learned=false;
+	have_vote=false;
 	centered_idle_ms=0.0;
+	drag_quiet_ms=0.0;
+	idle_voted=false;
+	offset_votes.clear();
 	line_lead_tiles=6.0;
 	sdl_mouse_scale=1.0;
 	mouse_fix=true;
@@ -2236,7 +2285,7 @@ return CR_OK;
 			sdl_mouse_seen?"called":"NOT called (using field edits)",dbg_sdl_events,dbg_sdl_shifted,
 			dbg_sdl_dx,dbg_sdl_dy,sdl_mouse_scale);
 		out.print("camera offset now: {} {} px | centred view offset {:.0f} {:.0f} ({})\n",
-			last_glide_x,last_glide_y,centered_off_x,centered_off_y,centered_learned?"learned":"estimated");
+			last_glide_x,last_glide_y,centered_off_x,centered_off_y,have_vote?"fine-tuned by watching":"from the map area size");
 		out.print("mouse compensation: tile shift {} {} (0 0 when the view is not offset)\n",
 			dbg_mouse_dx,dbg_mouse_dy);
 		out.print("camera: scrolls {} | landed {} (big re-centres {}) | waits {} | drag frames {}\n",
