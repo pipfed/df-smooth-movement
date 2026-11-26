@@ -52,7 +52,7 @@ REQUIRE_GLOBAL(world);
 
 namespace {
 
-constexpr const char *plugin_version="0.11.3-adv";
+constexpr const char *plugin_version="0.11.5-adv";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -160,6 +160,7 @@ double transient_x=0.0;                       // decaying glide offset, pixels
 double transient_y=0.0;
 double rest_x=0.0;                            // persistent free-camera offset, tiles
 double rest_y=0.0;                            // (positive = view sits WEST/NORTH of window)
+double pending_wait_ms=0.0;                  // how long a scroll has been pending
 int32_t camera_pending_dx=0;                  // scroll delta announced but not yet in the buffers
 int32_t camera_pending_dy=0;
 int32_t camera_pending_frames=0;
@@ -665,9 +666,8 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 		// snaps. If no re-centre comes, it settles onto the view it has.
 		lf.dest_x=-30000;
 		lf.hold_ms+=dtd;
-		const bool settle=lf.hold_ms>1500.0;
-		const double gx=settle?cwx:lf.ex;
-		const double gy=settle?cwy:lf.ey;
+		const double gx=cwx;   // the game re-centres at the click, so the view is already there
+		const double gy=cwy;
 		const double fx=gx-lf.cam_x;
 		const double fy=gy-lf.cam_y;
 		const double dist=std::hypot(fx,fy);
@@ -789,7 +789,10 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 	lf.cam_y=lf.sy+dy*lf.u;
 	double tx=(cwx-lf.cam_x)*tile;
 	double ty=(cwy-lf.cam_y)*tile;
-	const double lim=(line_lead_tiles+4.0+lf.pan_tiles)*tile;
+	// never let the camera sit more than ~14 tiles (or the starting pan) from the picture that
+	// is really in the buffers: further than that the screen shows the empty edge of the buffers
+	const double lim=std::min((line_lead_tiles+4.0+lf.pan_tiles)*tile,
+		std::max(14.0,lf.pan_tiles+2.0)*tile);
 	const double mag=std::hypot(tx,ty);
 	if(mag>lim)
 		{
@@ -806,7 +809,7 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 // --- trace (`smooth-movement-adv trace`) -----------------------------------------------------
 // Records one row per frame so the camera's real path can be inspected afterwards.
 bool trace_on=false;
-std::vector<std::array<double,16>> trace_rows;
+std::vector<std::array<double,19>> trace_rows;
 constexpr size_t trace_max_rows=20000;
 
 void trace_frame(uint32_t now_ms,int32_t wx,int32_t wy)
@@ -820,7 +823,8 @@ void trace_frame(uint32_t now_ms,int32_t wx,int32_t wy)
 		}
 	trace_rows.push_back({double(now_ms),px,py,dx,dy,double(wx),double(wy),
 		double(camera_pending_dx),double(camera_pending_dy),transient_x,transient_y,
-		rest_x,rest_y,line_follow.active?1.0:0.0,line_follow.cam_x,line_follow.cam_y});
+		rest_x,rest_y,line_follow.active?1.0:0.0,line_follow.cam_x,line_follow.cam_y,
+		drag_active?1.0:0.0,line_follow.finishing?1.0:0.0,pending_wait_ms});
 }
 
 bool trace_save(color_ostream &out)
@@ -833,7 +837,7 @@ bool trace_save(color_ostream &out)
 		return false;
 		}
 	f<<"ms,char_x,char_y,dest_x,dest_y,window_x,window_y,pending_dx,pending_dy,"
-		"transient_x_px,transient_y_px,rest_x,rest_y,line_active,cam_x,cam_y\n";
+		"transient_x_px,transient_y_px,rest_x,rest_y,line_active,cam_x,cam_y,drag,finishing,pending_ms\n";
 	for(const auto &r:trace_rows)
 		{
 		for(size_t i=0;i<r.size();++i)f<<r[i]<<(i+1<r.size()?",":"\n");
@@ -876,6 +880,21 @@ void update_camera(
 	camera_prev_wy=wy;
 	camera_has_prev=true;
 
+	if(camera_pending_dx==0&&camera_pending_dy==0)pending_wait_ms=0.0;
+	else
+		{
+		// A scroll announced by the game that never shows up in the buffers (a long walk can
+		// outrun the matching): give up after a while and take the game's view as it is.
+		pending_wait_ms+=double(delta_ms);
+		if(pending_wait_ms>1200.0)
+			{
+			pending_wait_ms=0.0;
+			cancel_camera_transients();
+			line_follow.active=false;
+			line_follow.finishing=false;
+			++dbg_cam_timeouts;
+			}
+		}
 	if(camera_pending_dx!=0||camera_pending_dy!=0)
 		{
 		if(std::abs(camera_pending_dx)>6||std::abs(camera_pending_dy)>6)
