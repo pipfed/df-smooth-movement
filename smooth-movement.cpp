@@ -52,7 +52,7 @@ REQUIRE_GLOBAL(world);
 
 namespace {
 
-constexpr const char *plugin_version="0.11.5-adv";
+constexpr const char *plugin_version="0.11.7-adv";
 
 // Runtime harness for the engine-owned visual state; gameplay data is never read.
 decltype(&SDL_RenderCopyF) render_copy_f=nullptr;
@@ -79,7 +79,7 @@ bool flip_enabled=false;
 // --- settings ---------------------------------------------------------------------------------
 uint32_t step_duration_ms=100;       // `smooth-movement-adv speed <ms>` (the shortest a step may take)
 bool adaptive_speed=true;            // `smooth-movement-adv adaptive on|off`
-uint32_t cam_speed_ms=0;             // `smooth-movement-adv camera speed <ms>|auto` (0 = follow steps)
+uint32_t cam_speed_ms=20;            // `smooth-movement-adv camera speed <ms>|auto` (default 20; 0 = follow steps)
 int32_t cam_ease=0;                  // `smooth-movement-adv camera ease linear|smooth|auto` (0 auto, 1 linear, 2 smooth)
 // The step length actually in use. With adaptive speed it follows how often steps really arrive,
 // so a run keeps the camera moving at one steady speed instead of glide, pause, glide.
@@ -220,7 +220,7 @@ bool have_vote=false;
 double vote_off_x=0.0,vote_off_y=0.0;
 struct offset_votest{int32_t x,y,count;};
 std::vector<offset_votest> offset_votes;   // in the order first seen
-double line_lead_tiles=6.0;                  // `camera lead <tiles>`: how far ahead of the character the camera may wait
+double line_lead_tiles=40.0;                  // `camera lead <tiles>`: how far ahead of the character the camera may wait
 
 // The unit the player controls in adventure mode. (world->units.active[0] is NOT reliably the
 // adventurer: a trace showed it standing still while the player walked.)
@@ -577,6 +577,27 @@ bool line_step(double tile,double cwx,double cwy,int32_t wx,int32_t wy,uint32_t 
 		{line_follow.active=false;return false;}
 	const df::unit *adv=player_unit();
 	if(adv==nullptr){line_follow.active=false;return false;}
+	{
+		// The game occasionally re-bases the local map's coordinates (about 48 tiles at once, e.g.
+		// walking toward the map's edge). The picture doesn't move, but every coordinate does. A
+		// walker only ever moves a tile per step, so a jump this big is that shift: carry the
+		// camera's own coordinates along, or it would try to travel 50 tiles to catch up.
+		static int32_t last_px=0,last_py=0;
+		static bool last_valid=false;
+		const int32_t jx=adv->pos.x-last_px;
+		const int32_t jy=adv->pos.y-last_py;
+		if(last_valid&&line_follow.active&&(std::abs(jx)>12||std::abs(jy)>12))
+			{
+			line_follow.cam_x+=jx;line_follow.cam_y+=jy;
+			line_follow.sx+=jx;line_follow.sy+=jy;
+			line_follow.ex+=jx;line_follow.ey+=jy;
+			line_follow.start_px+=jx;line_follow.start_py+=jy;
+			++dbg_cam_jumps;
+			}
+		last_px=adv->pos.x;
+		last_py=adv->pos.y;
+		last_valid=true;
+	}
 	{
 		// Centred on the character means the character sits in the middle of the map area, so the
 		// view's corner is half the map area up and to the left of them. The map area's own size
@@ -2171,7 +2192,7 @@ void reset_state()
 	camera_was_offset=false;
 	flip_enabled=false;
 	step_duration_ms=100;
-	cam_speed_ms=0;
+	cam_speed_ms=20;
 	cam_ease=0;
 	line_camera=true;
 	line_follow=line_followst{};
@@ -2181,7 +2202,7 @@ void reset_state()
 	drag_quiet_ms=0.0;
 	idle_voted=false;
 	offset_votes.clear();
-	line_lead_tiles=6.0;
+	line_lead_tiles=40.0;
 	sdl_mouse_scale=1.0;
 	mouse_fix=true;
 	effective_step_ms=100;
@@ -2215,7 +2236,7 @@ out.print(
 "  camera <fx> <fy>        park the camera at an offset in tiles (-0.99..0.99)\n"
 "  camera line on|off      straight-line glide to a click-to-move target (on)\n"
 "  camera lead <tiles>     how far ahead of the character the camera may\n"
-"                          run and wait (default 6)\n"
+"                          run and wait (default 40)\n"
 "  camera speed <20-1000>|auto\n"
 "                          camera time per tile, ms (auto = step speed)\n"
 "  camera ease linear|smooth|auto\n"
